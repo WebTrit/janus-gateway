@@ -6179,6 +6179,8 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				json_object_set_new(reg, "sip", json_string("event"));
 				json_t *reging = json_object();
 				json_object_set_new(reging, "event", json_string(event_name));
+				json_object_set_new(reging, "code", json_integer(status));
+				json_object_set_new(reging, "reason", json_string(phrase ? phrase : ""));
 				json_object_set_new(reging, "username", json_string(session->account.username));
 				if(event == nua_r_register) {
 					json_object_set_new(reging, "register_sent", json_true());
@@ -6214,6 +6216,8 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				if(notify_events && gateway->events_is_enabled()) {
 					json_t *info = json_object();
 					json_object_set_new(info, "event", json_string(event_name));
+					json_object_set_new(info, "code", json_integer(status));
+					json_object_set_new(info, "reason", json_string(phrase ? phrase : ""));
 					json_object_set_new(info, "identity", json_string(session->account.identity));
 					if(session->account.proxy)
 						json_object_set_new(info, "proxy", json_string(session->account.proxy));

@@ -895,6 +895,16 @@ static struct janus_json_parameter sipmessage_parameters[] = {
 	{"headers", JSON_OBJECT, 0},
 	{"call_id", JANUS_JSON_STRING, 0}
 };
+static struct janus_json_parameter publish_parameters[] = {
+	{"to", JSON_STRING, 0},
+	{"event", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"content_type", JSON_STRING, 0},
+	{"content", JSON_STRING, 0},
+	{"publish_ttl", JANUS_JSON_INTEGER, 0},
+	{"etag", JSON_STRING, 0},
+	{"headers", JSON_OBJECT, 0},
+	{"call_id", JANUS_JSON_STRING, 0}
+};
 static struct janus_json_parameter keyframe_parameters[] = {
 	{"user", JANUS_JSON_BOOL, 0},
 	{"peer", JANUS_JSON_BOOL, 0}
@@ -915,6 +925,8 @@ static char *user_agent;
 static int register_ttl = JANUS_DEFAULT_REGISTER_TTL;
 #define JANUS_DEFAULT_SUBSCRIBE_TTL 3600
 static int subscribe_ttl = JANUS_DEFAULT_SUBSCRIBE_TTL;
+#define JANUS_DEFAULT_PUBLISH_TTL 3600
+static int publish_ttl = JANUS_DEFAULT_PUBLISH_TTL;
 static uint16_t rtp_range_min = 10000;
 static uint16_t rtp_range_max = 60000;
 static int dscp_audio_rtp = 0;
@@ -5087,6 +5099,111 @@ static void *janus_sip_handler(void *data) {
 			g_hash_table_insert(messageids, g_strdup(message_callid), session);
 			janus_mutex_unlock(&sessions_mutex);
 			g_free(message_callid);
+		} else if(!strcasecmp(request_text, "publish")) {
+			/* Send a SIP PUBLISH request for an event package */
+			JANUS_VALIDATE_JSON_OBJECT(root, publish_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_SIP_ERROR_MISSING_ELEMENT, JANUS_SIP_ERROR_INVALID_ELEMENT);
+			if(error_code != 0)
+				goto error;
+			if(session->account.registration_status != janus_sip_registration_status_registered &&
+			   session->account.registration_status != janus_sip_registration_status_disabled) {
+				JANUS_LOG(LOG_ERR, "Wrong state (not registered)\n");
+				error_code = JANUS_SIP_ERROR_WRONG_STATE;
+				g_snprintf(error_cause, 512, "Wrong state (not registered)");
+				goto error;
+			}
+			const char *to = json_string_value(json_object_get(root, "to"));
+			if(to == NULL)
+				to = session->account.identity;
+			const char *event_type = json_string_value(json_object_get(root, "event"));
+			/* TTL */
+			int ttl = publish_ttl;
+			json_t *pub_ttl = json_object_get(root, "publish_ttl");
+			if(pub_ttl && json_is_integer(pub_ttl))
+				ttl = json_integer_value(pub_ttl);
+			if(ttl <= 0)
+				ttl = JANUS_DEFAULT_PUBLISH_TTL;
+			char ttl_text[20];
+			g_snprintf(ttl_text, sizeof(ttl_text), "%d", ttl);
+
+			/* Optional ETag for refresh/modify (If-Match) */
+			const char *etag = json_string_value(json_object_get(root, "etag"));
+
+			/* Prepare handle */
+			nua_handle_t *nh = NULL;
+			if(!session->helper) {
+				janus_mutex_lock(&session->stack->smutex);
+				if(session->stack->s_nua == NULL) {
+					janus_mutex_unlock(&session->stack->smutex);
+					JANUS_LOG(LOG_ERR, "NUA destroyed while publishing?\n");
+					error_code = JANUS_SIP_ERROR_LIBSOFIA_ERROR;
+					g_snprintf(error_cause, 512, "Invalid NUA");
+					goto error;
+				}
+				nh = nua_handle(session->stack->s_nua, session, TAG_END());
+				janus_mutex_unlock(&session->stack->smutex);
+			} else {
+				/* Use master's SIP stack */
+				if(session->master == NULL || session->master->stack == NULL) {
+					error_code = JANUS_SIP_ERROR_HELPER_ERROR;
+					g_snprintf(error_cause, 512, "Invalid master SIP stack");
+					goto error;
+				}
+				janus_mutex_lock(&session->master->stack->smutex);
+				if(session->master->stack->s_nua == NULL) {
+					janus_mutex_unlock(&session->master->stack->smutex);
+					JANUS_LOG(LOG_ERR, "NUA destroyed while publishing?\n");
+					error_code = JANUS_SIP_ERROR_LIBSOFIA_ERROR;
+					g_snprintf(error_cause, 512, "Invalid NUA");
+					goto error;
+				}
+				nh = nua_handle(session->master->stack->s_nua, session, TAG_END());
+				janus_mutex_unlock(&session->master->stack->smutex);
+			}
+
+			char custom_headers[2048];
+			janus_sip_parse_custom_headers(root, (char *)&custom_headers, sizeof(custom_headers));
+			char *contact_header = janus_sip_session_contact_header_retrieve(session);
+			char *proxy = session->helper && session->master ?
+					session->master->account.outbound_proxy : session->account.outbound_proxy;
+			const char *content_type = NULL;
+			json_t *content_type_text = json_object_get(root, "content_type");
+			if(content_type_text && json_is_string(content_type_text))
+				content_type = json_string_value(content_type_text);
+			const char *msg_content = NULL;
+			json_t *msg_content_text = json_object_get(root, "content");
+			if(msg_content_text && json_is_string(msg_content_text))
+				msg_content = json_string_value(msg_content_text);
+
+			/* Optional explicit call-id */
+			const char *callid = NULL;
+			json_t *request_callid = json_object_get(root, "call_id");
+			if(request_callid)
+				callid = json_string_value(request_callid);
+			if(callid == NULL) {
+					/* If call-id does not exist in request, create a random one */
+					callid = g_malloc0(24);
+					janus_sip_random_string(24, callid);
+				}
+
+			/* Send PUBLISH */
+			nua_publish(nh,
+				SIPTAG_TO_STR(to),
+				SIPTAG_EVENT_STR(event_type),
+				SIPTAG_CALL_ID_STR(callid),
+				TAG_IF(contact_header != NULL, SIPTAG_CONTACT_STR(contact_header)),
+				SIPTAG_EXPIRES_STR(ttl_text),
+				TAG_IF(proxy != NULL, NUTAG_PROXY(proxy)),
+				TAG_IF(strlen(custom_headers) > 0, SIPTAG_HEADER_STR(custom_headers)),
+				TAG_IF(content_type != NULL && msg_content != NULL, SIPTAG_CONTENT_TYPE_STR(content_type)),
+				TAG_IF(content_type != NULL && msg_content != NULL, SIPTAG_PAYLOAD_STR(msg_content)),
+				TAG_IF(etag != NULL, SIPTAG_IF_MATCH_STR(etag)),
+				TAG_END());
+			result = json_object();
+			json_object_set_new(result, "event", json_string("publishing"));
+			if(callid)
+				json_object_set_new(result, "call_id", json_string(callid));
 		} else if(!strcasecmp(request_text, "dtmf_info")) {
 			/* Send DMTF tones using SIP INFO
 			 * (https://tools.ietf.org/html/draft-kaplan-dispatch-info-dtmf-package-00)
@@ -6006,6 +6123,94 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				g_free(messageid);
 			}
 			break;
+		case nua_r_publish: {
+			JANUS_LOG(LOG_VERB, "[%s][%s]: %d %s\n", session->account.username, nua_event_name(event), status, phrase ? phrase : "??");
+			if(status == 200 || status == 202) {
+				/* Success */
+				json_t *eventj = json_object();
+				json_object_set_new(eventj, "sip", json_string("event"));
+				if(sip && sip->sip_call_id)
+					json_object_set_new(eventj, "call_id", json_string(sip->sip_call_id->i_id));
+				json_t *resultj = json_object();
+				json_object_set_new(resultj, "event", json_string("publish_succeeded"));
+				json_object_set_new(resultj, "code", json_integer(status));
+				if(session->incoming_header_prefixes) {
+					json_t *headers = janus_sip_get_incoming_headers(sip, session);
+					json_object_set_new(resultj, "headers", headers);
+				}
+				if (sip && sip->sip_expires)
+					json_object_set_new(resultj, "expires", json_integer(sip->sip_expires->ex_delta));
+				json_object_set_new(resultj, "reason", json_string(phrase ? phrase : ""));
+				json_object_set_new(eventj, "result", resultj);
+				int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, eventj, NULL);
+				JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+				json_decref(eventj);
+			} else if(status == 401 || status == 407) {
+				const char *scheme = NULL;
+				const char *realm = NULL;
+				if(status == 401) {
+					sip_www_authenticate_t const* www_auth = sip->sip_www_authenticate;
+					if(www_auth == NULL)
+						break;
+					scheme = www_auth->au_scheme;
+					realm = msg_params_find(www_auth->au_params, "realm=");
+				} else {
+					sip_proxy_authenticate_t const* proxy_auth = sip->sip_proxy_authenticate;
+					if(proxy_auth == NULL)
+						break;
+					scheme = proxy_auth->au_scheme;
+					realm = msg_params_find(proxy_auth->au_params, "realm=");
+				}
+				char authuser[100], secret[100];
+				memset(authuser, 0, sizeof(authuser));
+				memset(secret, 0, sizeof(secret));
+				if(session->helper) {
+					if(session->master == NULL) {
+						JANUS_LOG(LOG_WARN, "No master session for this helper, authentication will fail...\n");
+					} else {
+						session = session->master;
+					}
+				}
+				if(session->account.authuser && strchr(session->account.authuser, ':'))
+					g_snprintf(authuser, sizeof(authuser), "\"%s\"", session->account.authuser);
+				else
+					g_snprintf(authuser, sizeof(authuser), "%s", session->account.authuser);
+				if(session->account.secret && strchr(session->account.secret, ':'))
+					g_snprintf(secret, sizeof(secret), "\"%s\"", session->account.secret);
+				else
+					g_snprintf(secret, sizeof(secret), "%s", session->account.secret);
+				char auth[256];
+				memset(auth, 0, sizeof(auth));
+				g_snprintf(auth, sizeof(auth), "%s%s:%s:%s:%s%s",
+					session->account.secret_type == janus_sip_secret_type_hashed ? "HA1+" : "",
+					scheme,
+					realm,
+					authuser,
+					session->account.secret_type == janus_sip_secret_type_hashed ? "HA1+" : "",
+					secret);
+				JANUS_LOG(LOG_VERB, "\t%s\n", auth);
+				nua_authenticate(nh, NUTAG_AUTH(auth), TAG_END());
+			} else if(status >= 400) {
+				JANUS_LOG(LOG_WARN, "[%s] PUBLISH failed: %d %s\n", session->account.username, status, phrase ? phrase : "");
+				json_t *eventj = json_object();
+				json_object_set_new(eventj, "sip", json_string("event"));
+				if(sip && sip->sip_call_id)
+					json_object_set_new(eventj, "call_id", json_string(sip->sip_call_id->i_id));
+				json_t *resultj = json_object();
+				json_object_set_new(resultj, "event", json_string("publish_failed"));
+				json_object_set_new(resultj, "code", json_integer(status));
+				json_object_set_new(resultj, "reason", json_string(phrase ? phrase : ""));
+				if(session->incoming_header_prefixes) {
+					json_t *headers = janus_sip_get_incoming_headers(sip, session);
+					json_object_set_new(resultj, "headers", headers);
+				}
+				json_object_set_new(eventj, "result", resultj);
+				int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, eventj, NULL);
+				JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+				json_decref(eventj);
+			}
+			break;
+		}
 		case nua_r_refer: {
 			JANUS_LOG(LOG_VERB, "[%s][%s]: %d %s\n", session->account.username, nua_event_name(event), status, phrase ? phrase : "??");
 			/* We got a response to our REFER */
@@ -7651,7 +7856,7 @@ gpointer janus_sip_sofia_thread(gpointer user_data) {
 	session->stack->s_nua = nua_create(session->stack->s_root,
 				janus_sip_sofia_callback,
 				session,
-				SIPTAG_ALLOW_STR("INVITE, ACK, BYE, CANCEL, OPTIONS, REFER, MESSAGE, INFO, NOTIFY"),
+				SIPTAG_ALLOW_STR("INVITE, ACK, BYE, CANCEL, OPTIONS, REFER, MESSAGE, INFO, NOTIFY, PUBLISH"),
 				NUTAG_M_USERNAME(session->account.username),
 				NUTAG_URL(sip_url),
 				TAG_IF(session->account.sips, NUTAG_SIPS_URL(sips_url)),

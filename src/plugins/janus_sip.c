@@ -5123,8 +5123,8 @@ static void *janus_sip_handler(void *data) {
 			json_t *pub_ttl = json_object_get(root, "publish_ttl");
 			if(pub_ttl && json_is_integer(pub_ttl))
 				ttl = json_integer_value(pub_ttl);
-			if(ttl <= 0)
-				ttl = JANUS_DEFAULT_PUBLISH_TTL;
+			// if(ttl <= 0)
+			// 	ttl = JANUS_DEFAULT_PUBLISH_TTL;
 			char ttl_text[20];
 			g_snprintf(ttl_text, sizeof(ttl_text), "%d", ttl);
 

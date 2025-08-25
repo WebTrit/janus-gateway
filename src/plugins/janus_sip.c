@@ -1034,6 +1034,7 @@ struct ssip_s {
 	nua_handle_t *s_nh_r, *s_nh_i, *s_nh_m;
 	char *contact_header;	/* Only needed for Sofia SIP >= 1.13 */
 	GHashTable *subscriptions;
+	GHashTable *publishers;
 	janus_mutex smutex;
 	struct janus_sip_session *session;
 };
@@ -5130,37 +5131,34 @@ static void *janus_sip_handler(void *data) {
 			/* Optional ETag for refresh/modify (If-Match) */
 			const char *etag = json_string_value(json_object_get(root, "etag"));
 
-			/* Prepare handle */
+			/* Prepare or reuse per-event handle (publishers) */
 			nua_handle_t *nh = NULL;
-			if(!session->helper) {
-				janus_mutex_lock(&session->stack->smutex);
-				if(session->stack->s_nua == NULL) {
+			janus_mutex_lock(&session->stack->smutex);
+			if(session->stack->publishers != NULL)
+				nh = g_hash_table_lookup(session->stack->publishers, (char *)event_type);
+			if(nh == NULL) {
+				/* Create a handle in the appropriate NUA */
+				nua_t *use_nua = NULL;
+				ssip_t *use_stack = session->stack;
+				if(session->helper && session->master && session->master->stack)
+					use_stack = session->master->stack;
+				if(use_stack->s_nua == NULL) {
 					janus_mutex_unlock(&session->stack->smutex);
 					JANUS_LOG(LOG_ERR, "NUA destroyed while publishing?\n");
 					error_code = JANUS_SIP_ERROR_LIBSOFIA_ERROR;
 					g_snprintf(error_cause, 512, "Invalid NUA");
 					goto error;
 				}
-				nh = nua_handle(session->stack->s_nua, session, TAG_END());
-				janus_mutex_unlock(&session->stack->smutex);
-			} else {
-				/* Use master's SIP stack */
-				if(session->master == NULL || session->master->stack == NULL) {
-					error_code = JANUS_SIP_ERROR_HELPER_ERROR;
-					g_snprintf(error_cause, 512, "Invalid master SIP stack");
-					goto error;
+				use_nua = use_stack->s_nua;
+				nh = nua_handle(use_nua, session, TAG_END());
+				if(session->stack->publishers == NULL) {
+					/* Create table for mapping publishers too */
+					session->stack->publishers = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+						(GDestroyNotify)g_free, (GDestroyNotify)nua_handle_destroy);
 				}
-				janus_mutex_lock(&session->master->stack->smutex);
-				if(session->master->stack->s_nua == NULL) {
-					janus_mutex_unlock(&session->master->stack->smutex);
-					JANUS_LOG(LOG_ERR, "NUA destroyed while publishing?\n");
-					error_code = JANUS_SIP_ERROR_LIBSOFIA_ERROR;
-					g_snprintf(error_cause, 512, "Invalid NUA");
-					goto error;
-				}
-				nh = nua_handle(session->master->stack->s_nua, session, TAG_END());
-				janus_mutex_unlock(&session->master->stack->smutex);
+				g_hash_table_insert(session->stack->publishers, g_strdup(event_type), nh);
 			}
+			janus_mutex_unlock(&session->stack->smutex);
 
 			char custom_headers[2048];
 			janus_sip_parse_custom_headers(root, (char *)&custom_headers, sizeof(custom_headers));
@@ -7837,6 +7835,7 @@ gpointer janus_sip_sofia_thread(gpointer user_data) {
 	session->stack->s_nh_m = NULL;
 	session->stack->s_root = su_root_create(session->stack);
 	session->stack->subscriptions = NULL;
+	session->stack->publishers = NULL;
 	janus_mutex_init(&session->stack->smutex);
 	JANUS_LOG(LOG_VERB, "Setting up sofia stack (sip:%s@%s)\n", session->account.username, local_ip);
 	char sip_url[128];
@@ -7894,6 +7893,9 @@ gpointer janus_sip_sofia_thread(gpointer user_data) {
 	if(session->stack->subscriptions != NULL)
 		g_hash_table_unref(session->stack->subscriptions);
 	session->stack->subscriptions = NULL;
+	if(session->stack->publishers != NULL)
+		g_hash_table_unref(session->stack->publishers);
+	session->stack->publishers = NULL;
 	janus_mutex_unlock(&session->stack->smutex);
 	nua_destroy(s_nua);
 	su_root_destroy(session->stack->s_root);

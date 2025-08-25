@@ -3568,6 +3568,15 @@ static void *janus_sip_handler(void *data) {
 			/* Retrieve the outbound proxy */
 			char *proxy = session->helper && session->master ?
 					session->master->account.outbound_proxy : session->account.outbound_proxy;
+			/* Retrieve the content */
+			const char *content_type = NULL;
+			json_t *content_type_text = json_object_get(root, "content_type");
+			if(content_type_text && json_is_string(content_type_text))
+				content_type = json_string_value(content_type_text);
+			const char *msg_content = NULL;
+			json_t *msg_content_text = json_object_get(root, "content");
+			if(msg_content_text && json_is_string(msg_content_text))
+				msg_content = json_string_value(msg_content_text);
 
 			/* Send the SUBSCRIBE */
 			nua_subscribe(nh,
@@ -3579,6 +3588,8 @@ static void *janus_sip_handler(void *data) {
 				SIPTAG_EXPIRES_STR(ttl_text),
 				TAG_IF(proxy != NULL, NUTAG_PROXY(proxy)),
 				TAG_IF(strlen(custom_headers) > 0, SIPTAG_HEADER_STR(custom_headers)),
+				TAG_IF(content_type != NULL && msg_content != NULL, SIPTAG_CONTENT_TYPE_STR(content_type)),
+				TAG_IF(content_type != NULL && msg_content != NULL, SIPTAG_PAYLOAD_STR(msg_content)),
 				TAG_END());
 			result = json_object();
 			json_object_set_new(result, "event", json_string("subscribing"));

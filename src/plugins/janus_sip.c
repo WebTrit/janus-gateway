@@ -5140,8 +5140,8 @@ static void *janus_sip_handler(void *data) {
 			json_t *pub_ttl = json_object_get(root, "publish_ttl");
 			if(pub_ttl && json_is_integer(pub_ttl))
 				ttl = json_integer_value(pub_ttl);
-			// if(ttl <= 0)
-			// 	ttl = JANUS_DEFAULT_PUBLISH_TTL;
+			if(ttl <= 0)
+				ttl = JANUS_DEFAULT_PUBLISH_TTL;
 			char ttl_text[20];
 			g_snprintf(ttl_text, sizeof(ttl_text), "%d", ttl);
 
@@ -5219,6 +5219,59 @@ static void *janus_sip_handler(void *data) {
 			json_object_set_new(result, "event", json_string("publishing"));
 			if(callid)
 				json_object_set_new(result, "call_id", json_string(callid));
+		} else if(!strcasecmp(request_text, "unpublish")) {
+			/* Unpublish from some SIP events */
+			JANUS_VALIDATE_JSON_OBJECT(root, publish_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_SIP_ERROR_MISSING_ELEMENT, JANUS_SIP_ERROR_INVALID_ELEMENT);
+			if(error_code != 0)
+				goto error;
+			if(session->account.registration_status != janus_sip_registration_status_registered &&
+					session->account.registration_status != janus_sip_registration_status_disabled) {
+				JANUS_LOG(LOG_ERR, "Wrong state (not registered)\n");
+				error_code = JANUS_SIP_ERROR_WRONG_STATE;
+				g_snprintf(error_cause, 512, "Wrong state (not registered)");
+				goto error;
+			}
+			const char *to = json_string_value(json_object_get(root, "to"));
+			if(to == NULL)
+				to = session->account.identity;
+			const char *event_type = json_string_value(json_object_get(root, "event"));
+
+			/* Get the handle we used for this publishing */
+			janus_mutex_lock(&session->stack->smutex);
+			nua_handle_t *nh = NULL;
+			if(session->stack->publishers != NULL)
+				nh = g_hash_table_lookup(session->stack->publishers, (char *)event_type);
+			janus_mutex_unlock(&session->stack->smutex);
+			if(nh == NULL) {
+				JANUS_LOG(LOG_ERR, "Wrong state (no publishers to this event)\n");
+				error_code = JANUS_SIP_ERROR_WRONG_STATE;
+				g_snprintf(error_cause, 512, "Wrong state (no publishers to this event)");
+				goto error;
+			}
+
+			/* Optional explicit call-id */
+			const char *callid = NULL;
+			json_t *request_callid = json_object_get(root, "call_id");
+			if(request_callid)
+				callid = json_string_value(request_callid);
+			if(callid == NULL) {
+				JANUS_LOG(LOG_ERR, "Missing call_id\n");
+				error_code = JANUS_SIP_ERROR_MISSING_ELEMENT;
+				g_snprintf(error_cause, 512, "Missing call_id");
+				goto error;
+			}
+
+			/* Send the PUBLISH with Expires set to 0 */
+			nua_publish(nh,
+				SIPTAG_TO_STR(to),
+				SIPTAG_EVENT_STR(event_type),
+				SIPTAG_CALL_ID_STR(callid),
+				SIPTAG_EXPIRES_STR("0"), TAG_END()
+			);
+			result = json_object();
+			json_object_set_new(result, "event", json_string("unpublishing"));
 		} else if(!strcasecmp(request_text, "dtmf_info")) {
 			/* Send DMTF tones using SIP INFO
 			 * (https://tools.ietf.org/html/draft-kaplan-dispatch-info-dtmf-package-00)

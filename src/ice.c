@@ -319,33 +319,6 @@ void janus_ice_stop_static_event_loops(void) {
 	janus_mutex_unlock(&event_loops_mutex);
 }
 
-/* libnice debugging */
-static gboolean janus_ice_debugging_enabled;
-gboolean janus_ice_is_ice_debugging_enabled(void) {
-	return janus_ice_debugging_enabled;
-}
-void janus_ice_debugging_enable(void) {
-	JANUS_LOG(LOG_VERB, "Enabling libnice debugging...\n");
-	if(g_getenv("NICE_DEBUG") == NULL) {
-		JANUS_LOG(LOG_WARN, "No NICE_DEBUG environment variable set, setting maximum debug\n");
-		g_setenv("NICE_DEBUG", "all", TRUE);
-	}
-	if(g_getenv("G_MESSAGES_DEBUG") == NULL) {
-		JANUS_LOG(LOG_WARN, "No G_MESSAGES_DEBUG environment variable set, setting maximum debug\n");
-		g_setenv("G_MESSAGES_DEBUG", "all", TRUE);
-	}
-	JANUS_LOG(LOG_VERB, "Debugging NICE_DEBUG=%s G_MESSAGES_DEBUG=%s\n",
-		g_getenv("NICE_DEBUG"), g_getenv("G_MESSAGES_DEBUG"));
-	janus_ice_debugging_enabled = TRUE;
-	nice_debug_enable(strstr(g_getenv("NICE_DEBUG"), "all") || strstr(g_getenv("NICE_DEBUG"), "stun"));
-}
-void janus_ice_debugging_disable(void) {
-	JANUS_LOG(LOG_VERB, "Disabling libnice debugging...\n");
-	janus_ice_debugging_enabled = FALSE;
-	nice_debug_disable(TRUE);
-}
-
-
 /* NAT 1:1 stuff */
 static gboolean nat_1_1_enabled = FALSE;
 static gboolean keep_private_host = FALSE;
@@ -789,7 +762,7 @@ void janus_ice_relay_rtcp_internal(janus_ice_handle *handle, janus_ice_peerconne
 
 /* Map of active plugin sessions */
 static GHashTable *plugin_sessions;
-static janus_mutex plugin_sessions_mutex;
+static janus_mutex plugin_sessions_mutex = JANUS_MUTEX_INITIALIZER;
 gboolean janus_plugin_session_is_alive(janus_plugin_session *plugin_session) {
 	if(plugin_session == NULL || plugin_session < (janus_plugin_session *)0x1000 ||
 			g_atomic_int_get(&plugin_session->stopped))
@@ -1062,9 +1035,6 @@ void janus_ice_init(gboolean ice_lite, gboolean ice_tcp, gboolean full_trickle, 
 		}
 #endif
 	}
-	/* libnice debugging is disabled unless explicitly stated */
-	nice_debug_disable(TRUE);
-
 	/*! \note The RTP/RTCP port range configuration may be just a placeholder: for
 	 * instance, libnice supports this since 0.1.0, but the 0.1.3 on Fedora fails
 	 * when linking with an undefined reference to \c nice_agent_set_port_range
@@ -1085,7 +1055,6 @@ void janus_ice_init(gboolean ice_lite, gboolean ice_tcp, gboolean full_trickle, 
 
 	/* We keep track of plugin sessions to avoid problems */
 	plugin_sessions = g_hash_table_new_full(NULL, NULL, NULL, (GDestroyNotify)janus_plugin_session_dereference);
-	janus_mutex_init(&plugin_sessions_mutex);
 
 #ifdef HAVE_TURNRESTAPI
 	/* Initialize the TURN REST API client stack, whether we're going to use it or not */
@@ -1628,6 +1597,7 @@ static void janus_ice_handle_free(const janus_refcount *handle_ref) {
 	}
 	g_free(handle->opaque_id);
 	g_free(handle->token);
+	janus_mutex_destroy(&handle->mutex);
 	g_free(handle);
 }
 
@@ -1864,8 +1834,8 @@ static void janus_ice_peerconnection_free(const janus_refcount *pc_ref) {
 	pc->rtx_payload_types_rev = NULL;
 	if(pc->nacks_queue != NULL)
 		g_queue_free(pc->nacks_queue);
+	janus_mutex_destroy(&pc->mutex);
 	g_free(pc);
-	pc = NULL;
 }
 
 janus_ice_peerconnection_medium *janus_ice_peerconnection_medium_create(janus_ice_handle *handle, janus_media_type type) {
@@ -1998,8 +1968,8 @@ static void janus_ice_peerconnection_medium_free(const janus_refcount *medium_re
 		janus_seq_list_free(&medium->last_seqs[1]);
 	if(medium->last_seqs[2])
 		janus_seq_list_free(&medium->last_seqs[2]);
+	janus_mutex_destroy(&medium->mutex);
 	g_free(medium);
-	//~ janus_mutex_unlock(&handle->mutex);
 }
 
 /* Call plugin slow_link callback if a minimum of lost packets are detected within a second */

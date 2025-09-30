@@ -1885,9 +1885,11 @@ static void janus_audiobridge_participant_clear_inbuf(janus_audiobridge_particip
 
 static void janus_audiobridge_participant_clear_outbuf(janus_audiobridge_participant *participant) {
 	while(participant->outbuf && g_async_queue_length(participant->outbuf) > 0) {
-		janus_audiobridge_rtp_relay_packet *pkt = g_async_queue_pop(participant->outbuf);
-		g_free(pkt->data);
-		g_free(pkt);
+		janus_audiobridge_rtp_relay_packet *pkt = g_async_queue_try_pop(participant->outbuf);
+		if(pkt) {
+			g_free(pkt->data);
+			g_free(pkt);
+		}
 	}
 }
 
@@ -1948,6 +1950,9 @@ static void janus_audiobridge_participant_free(const janus_refcount *participant
 	janus_mutex_lock(&participant->pmutex);
 	janus_audiobridge_plainrtp_media_cleanup(&participant->plainrtp_media);
 	janus_mutex_unlock(&participant->pmutex);
+	janus_mutex_destroy(&participant->pmutex);
+	janus_mutex_destroy(&participant->qmutex);
+	janus_mutex_destroy(&participant->rec_mutex);
 	g_free(participant);
 }
 
@@ -2003,6 +2008,8 @@ static void janus_audiobridge_room_free(const janus_refcount *audiobridge_ref) {
 		g_hash_table_destroy(audiobridge->groups);
 	if(audiobridge->groups_byid)
 		g_hash_table_destroy(audiobridge->groups_byid);
+	janus_mutex_destroy(&audiobridge->mutex);
+	janus_mutex_destroy(&audiobridge->rtp_mutex);
 	g_free(audiobridge);
 }
 
@@ -8236,8 +8243,13 @@ static void *janus_audiobridge_handler(void *data) {
 				answer->s_name = g_strdup(s_name);
 				/* Add an fmtp attribute if this is Opus */
 				if(participant->codec == JANUS_AUDIOCODEC_OPUS) {
-					janus_sdp_attribute *a = janus_sdp_attribute_create("fmtp", "%s", fmtp);
-					janus_sdp_attribute_add_to_mline(janus_sdp_mline_find(answer, JANUS_SDP_AUDIO), a);
+					janus_sdp_mline *m = janus_sdp_mline_find(answer, JANUS_SDP_AUDIO);
+					if(m != NULL) {
+						janus_sdp_attribute *a = janus_sdp_attribute_create("fmtp", "%s", fmtp);
+						janus_sdp_attribute_add_to_mline(m, a);
+					} else {
+						JANUS_LOG(LOG_ERR, "No audio m-line found in SDP answer\n");
+					}
 				}
 				/* Let's overwrite a couple o= fields, in case this is a renegotiation */
 				answer->o_sessid = session->sdp_sessid;
@@ -9199,7 +9211,7 @@ static void *janus_audiobridge_participant_thread(void *data) {
 							participant->codec == JANUS_AUDIOCODEC_OPUS ? "Opus" : "G.711");
 						g_atomic_int_set(&participant->decoding, 0);
 						janus_audiobridge_buffer_packet_destroy(bpkt);
-						break;
+						continue;
 					}
 					rtp = (janus_rtp_header *)buffer;
 					first = FALSE;
@@ -9225,7 +9237,7 @@ static void *janus_audiobridge_participant_thread(void *data) {
 							janus_audiobridge_buffer_packet_destroy(bpkt);
 							g_free(pkt->data);
 							g_free(pkt);
-							break;
+							continue;
 						}
 						int i = 0;
 						uint16_t *samples = (uint16_t *)pkt->data;
@@ -9259,7 +9271,7 @@ static void *janus_audiobridge_participant_thread(void *data) {
 						}
 						g_free(pkt->data);
 						g_free(pkt);
-						break;
+						continue;
 					}
 					/* Queue the decoded packet for the mixer */
 					janus_mutex_lock(&participant->qmutex);

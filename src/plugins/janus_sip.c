@@ -6523,8 +6523,13 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				json_t *headers = janus_sip_get_incoming_headers(sip, session);
 				json_object_set_new(result, "headers", headers);
 			}
-			if(session->callid)
-				json_object_set_new(message, "call_id", json_string(session->callid));
+			/* We use call_id from the SIP message itself, not from session->callid.
+			 * This is because session->callid is only set for INVITE requests (active calls),
+			 * while MESSAGE requests can arrive out-of-dialog (without an active call).
+			 * Using sip->sip_call_id ensures we always have the correct Call-ID from the
+			 * actual SIP MESSAGE, regardless of whether there's an active call or not. */
+			if(sip && sip->sip_call_id)
+				json_object_set_new(message, "call_id", json_string(sip->sip_call_id->i_id));
 			json_object_set_new(result, "content_type", json_string(content_type));
 			json_object_set_new(message, "result", result);
 			int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, message, NULL);

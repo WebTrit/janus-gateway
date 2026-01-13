@@ -2091,10 +2091,7 @@ char *janus_nosip_sdp_manipulate(janus_nosip_session *session, janus_sdp *sdp, g
 			if(!strcasecmp(a->name, "mid")
 					|| !strcasecmp(a->name, "msid")
 					|| !strcasecmp(a->name, "bundle-only")
-					|| (!strcasecmp(a->name, "rtcp-fb") && a->value && strstr(a->value, "nack pli") == NULL)
-					|| (!strcasecmp(a->name, "extmap") && a->value &&
-						strstr(a->value, JANUS_RTP_EXTMAP_AUDIO_LEVEL) == NULL &&
-						strstr(a->value, JANUS_RTP_EXTMAP_VIDEO_ORIENTATION) == NULL)) {
+					|| (!strcasecmp(a->name, "rtcp-fb") && a->value && strstr(a->value, "nack pli") == NULL)) {
 				m->attributes = g_list_remove(m->attributes, a);
 				tempA = m->attributes;
 				janus_sdp_attribute_destroy(a);

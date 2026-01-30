@@ -6793,6 +6793,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					secret);
 				JANUS_LOG(LOG_VERB, "\t%s\n", auth);
 				nua_authenticate(nh, NUTAG_AUTH(auth), TAG_END());
+				break;
 			} else if(status >= 400) {
 				JANUS_LOG(LOG_WARN, "[%s] PUBLISH failed: %d %s\n", session->account.username, status, phrase ? phrase : "");
 				json_t *eventj = json_object();

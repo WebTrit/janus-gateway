@@ -203,6 +203,8 @@ janus_sdp_mtype janus_sdp_parse_mtype(const char *type) {
 		return JANUS_SDP_VIDEO;
 	if(!strcasecmp(type, "application"))
 		return JANUS_SDP_APPLICATION;
+	if(!strcasecmp(type, "text"))
+		return JANUS_SDP_TEXT;
 	return JANUS_SDP_OTHER;
 }
 
@@ -214,6 +216,8 @@ const char *janus_sdp_mtype_str(janus_sdp_mtype type) {
 			return "video";
 		case JANUS_SDP_APPLICATION:
 			return "application";
+		case JANUS_SDP_TEXT:
+			return "text";
 		case JANUS_SDP_OTHER:
 		default:
 			break;
@@ -482,12 +486,10 @@ janus_sdp *janus_sdp_parse(const char *sdp, char *error, size_t errlen) {
 					m->index = mlines;
 					mlines++;
 					m->type = janus_sdp_parse_mtype(type);
-					if(m->type == JANUS_SDP_OTHER) {
-						janus_sdp_mline_destroy(m);
-						if(error)
-							g_snprintf(error, errlen, "Invalid m= line: %s", line);
-						success = FALSE;
-						break;
+					/* RFC 3264 compliance: If we receive unsupported m=text (RTT/T.140),
+					 * set port to 0 to indicate rejection instead of failing the entire SDP */
+					if(m->type == JANUS_SDP_TEXT) {
+						m->port = 0;
 					}
 					m->type_str = g_strdup(type);
 					m->proto = g_strdup(proto);

@@ -1169,7 +1169,7 @@ char *janus_sdp_write(janus_sdp *imported) {
 		janus_sdp_mline *m = (janus_sdp_mline *)temp->data;
 		g_snprintf(buffer, sizeof(buffer), "m=%s %d %s", m->type_str, m->port, m->proto);
 		janus_strlcat_fast(mline, buffer, mlen, &moffset);
-		if(m->port == 0 && m->type != JANUS_SDP_APPLICATION && m->type != JANUS_SDP_TEXT) {
+		if(m->port == 0 && m->type != JANUS_SDP_APPLICATION) {
 			/* Remove all payload types/formats if we're rejecting the media */
 			g_list_free_full(m->fmts, (GDestroyNotify)g_free);
 			m->fmts = NULL;
@@ -1198,7 +1198,7 @@ char *janus_sdp_write(janus_sdp *imported) {
 		}
 		janus_strlcat_fast(mline, "\r\n", mlen, &moffset);
 		/* c= */
-		if(m->c_addr != NULL && m->type != JANUS_SDP_TEXT) {
+		if(m->c_addr != NULL) {
 			g_snprintf(buffer, sizeof(buffer), "c=IN %s %s\r\n",
 				m->c_ipv4 ? "IP4" : "IP6", m->c_addr);
 			janus_strlcat_fast(mline, buffer, mlen, &moffset);

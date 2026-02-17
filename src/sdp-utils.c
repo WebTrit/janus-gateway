@@ -486,10 +486,12 @@ janus_sdp *janus_sdp_parse(const char *sdp, char *error, size_t errlen) {
 					m->index = mlines;
 					mlines++;
 					m->type = janus_sdp_parse_mtype(type);
-					/* RFC 3264 compliance: If we receive unsupported m=text (RTT/T.140),
-					 * set port to 0 to indicate rejection instead of failing the entire SDP */
-					if(m->type == JANUS_SDP_TEXT) {
-						m->port = 0;
+					if(m->type == JANUS_SDP_OTHER) {
+						janus_sdp_mline_destroy(m);
+						if(error)
+							g_snprintf(error, errlen, "Invalid m= line: %s", line);
+						success = FALSE;
+						break;
 					}
 					m->type_str = g_strdup(type);
 					m->proto = g_strdup(proto);

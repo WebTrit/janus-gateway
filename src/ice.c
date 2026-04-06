@@ -3873,10 +3873,38 @@ int janus_ice_setup_local(janus_ice_handle *handle, gboolean offer, gboolean tri
 void janus_ice_restart(janus_ice_handle *handle) {
 	if(!handle || !handle->agent || !handle->pc)
 		return;
+	janus_ice_peerconnection *pc = handle->pc;
 	/* Restart ICE */
 	if(nice_agent_restart(handle->agent) == FALSE) {
 		JANUS_LOG(LOG_WARN, "[%"SCNu64"] ICE restart failed...\n", handle->handle_id);
 	}
+	/* Recreate the DTLS context so a fresh ClientHello from the peer is treated as a new
+	 * handshake rather than RFC 5746 renegotiation. When the peer creates a new
+	 * RTCPeerConnection (e.g. after app restart), it sends a ClientHello with no
+	 * renegotiation_info. The existing connected SSL* rejects this with a fatal
+	 * handshake_failure alert, leaving DTLS stuck in connecting state. */
+	if(pc->dtlsrt_source != NULL) {
+		g_source_destroy(pc->dtlsrt_source);
+		g_source_unref(pc->dtlsrt_source);
+		pc->dtlsrt_source = NULL;
+	}
+	if(pc->dtls != NULL) {
+		janus_dtls_srtp_destroy(pc->dtls);
+		janus_refcount_decrease(&pc->dtls->ref);
+		pc->dtls = NULL;
+	}
+	pc->dtls = janus_dtls_srtp_create(pc, pc->dtls_role);
+	if(!pc->dtls) {
+		JANUS_LOG(LOG_ERR, "[%"SCNu64"] Error recreating DTLS-SRTP stack on ICE restart...\n", handle->handle_id);
+		janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
+		janus_ice_webrtc_hangup(handle, "DTLS-SRTP stack error on ICE restart");
+		return;
+	}
+	janus_refcount_increase(&pc->dtls->ref);
+	/* Reset pc->connected so the DTLS handshake is triggered again when ICE
+	 * reconnects. Without this, the guard in janus_ice_cb_nice_ready prevents
+	 * re-entering the handshake path after an ICE restart. */
+	pc->connected = 0;
 	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
 }
 

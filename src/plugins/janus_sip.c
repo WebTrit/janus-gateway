@@ -1254,6 +1254,7 @@ typedef struct janus_sip_media {
 	char *remote_audio_ip;			/* Peer audio media IP address */
 	char *remote_video_ip;			/* Peer video media IP address */
 	gboolean earlymedia;
+	gboolean earlymedia_video_recovery;	/* TRUE when we fired a synthetic updatingcall after 200 OK added video vs audio-only 183 */
 	gboolean update;
 	gboolean autoaccept_reinvites;
 	gboolean ready;
@@ -1791,6 +1792,7 @@ static void janus_sip_media_reset(janus_sip_session *session) {
 	g_free(session->media.remote_video_ip);
 	session->media.remote_video_ip = NULL;
 	session->media.earlymedia = FALSE;
+	session->media.earlymedia_video_recovery = FALSE;
 	session->media.update = FALSE;
 	session->media.updated = FALSE;
 	session->media.autoaccept_reinvites = TRUE;
@@ -2586,6 +2588,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->media.remote_audio_ip = NULL;
 	session->media.remote_video_ip = NULL;
 	session->media.earlymedia = FALSE;
+	session->media.earlymedia_video_recovery = FALSE;
 	session->media.update = FALSE;
 	session->media.autoaccept_reinvites = TRUE;
 	session->media.ready = FALSE;
@@ -3188,6 +3191,7 @@ static void janus_sip_hangup_media_internal(janus_plugin_session *handle) {
 		janus_mutex_unlock(&session->mutex);
 		/* Send a BYE */
 		session->media.earlymedia = FALSE;
+		session->media.earlymedia_video_recovery = FALSE;
 		session->media.update = FALSE;
 		session->media.autoaccept_reinvites = TRUE;
 		session->media.ready = FALSE;
@@ -4733,7 +4737,20 @@ static void *janus_sip_handler(void *data) {
 			session->sdp = parsed_sdp;
 			session->media.update = offer;
 			JANUS_LOG(LOG_VERB, "Prepared SDP for update:\n%s", sdp);
-			if(session->status == janus_sip_call_status_incall) {
+			if(session->media.earlymedia_video_recovery && !offer) {
+				/* This is the client's answer to our synthetic updatingcall (video recovery after
+				 * audio-only 183 followed by 200 OK with video). There is no incoming re-INVITE to
+				 * respond to; instead, send a re-INVITE to the remote peer to add video. */
+				JANUS_LOG(LOG_VERB, "earlymedia video recovery: converting answer into outgoing re-INVITE\n");
+				session->media.earlymedia_video_recovery = FALSE;
+				session->media.update = TRUE;
+				janus_sip_call_update_status(session, janus_sip_call_status_incall);
+				char *contact_header = janus_sip_session_contact_header_retrieve(session);
+				nua_invite(session->stack->s_nh_i,
+					TAG_IF(contact_header != NULL, SIPTAG_CONTACT_STR(contact_header)),
+					SOATAG_USER_SDP_STR(sdp),
+					TAG_END());
+			} else if(session->status == janus_sip_call_status_incall) {
 				/* Retrieve the Contact header for manually adding if not NULL */
 				char *contact_header = janus_sip_session_contact_header_retrieve(session);
 				/* We're sending a re-INVITE ourselves */
@@ -4830,6 +4847,7 @@ static void *janus_sip_handler(void *data) {
 			}
 			janus_mutex_unlock(&session->mutex);
 			session->media.earlymedia = FALSE;
+			session->media.earlymedia_video_recovery = FALSE;
 			session->media.update = FALSE;
 			session->media.autoaccept_reinvites = TRUE;
 			session->media.ready = FALSE;
@@ -5076,6 +5094,7 @@ static void *janus_sip_handler(void *data) {
 			}
 			janus_mutex_unlock(&session->mutex);
 			session->media.earlymedia = FALSE;
+			session->media.earlymedia_video_recovery = FALSE;
 			session->media.update = FALSE;
 			session->media.autoaccept_reinvites = TRUE;
 			session->media.ready = FALSE;
@@ -6056,6 +6075,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			} else if(callstate == nua_callstate_terminated &&
 					(session->stack->s_nh_i == nh || session->stack->s_nh_i == NULL)) {
 				session->media.earlymedia = FALSE;
+				session->media.earlymedia_video_recovery = FALSE;
 				session->media.update = FALSE;
 				session->media.autoaccept_reinvites = TRUE;
 				session->media.ready = FALSE;
@@ -7051,6 +7071,8 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			char *fixed_sdp = sip->sip_payload->pl_data;
 			gboolean changed = FALSE;
 			gboolean update = session->media.ready;
+			/* Save remote video port before processing, to detect if 200 OK adds video vs audio-only 183 */
+			int pre_sdp_process_remote_video_rtp_port = session->media.remote_video_rtp_port;
 			janus_sip_sdp_process(session, sdp, TRUE, update, &changed);
 			/* If we asked for SRTP and are not getting it, fail */
 			gboolean has_srtp = TRUE;
@@ -7063,6 +7085,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				janus_sdp_destroy(sdp);
 				/* Hangup immediately */
 				session->media.earlymedia = FALSE;
+				session->media.earlymedia_video_recovery = FALSE;
 				session->media.update = FALSE;
 				session->media.autoaccept_reinvites = TRUE;
 				session->media.ready = FALSE;
@@ -7081,6 +7104,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				janus_sdp_destroy(sdp);
 				/* Hangup immediately */
 				session->media.earlymedia = FALSE;
+				session->media.earlymedia_video_recovery = FALSE;
 				session->media.update = FALSE;
 				session->media.autoaccept_reinvites = TRUE;
 				session->media.ready = FALSE;
@@ -7136,6 +7160,9 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				}
 			}
 			/* Send event back to the application */
+			/* Detect if 200 OK added video that was absent in audio-only 183 */
+			gboolean earlymedia_video_added = (!in_progress && session->media.earlymedia &&
+				pre_sdp_process_remote_video_rtp_port == 0 && session->media.remote_video_rtp_port != 0);
 			json_t *jsep = NULL;
 			if(!session->media.earlymedia) {
 				jsep = json_pack("{ssss}", "type", "answer", "sdp", fixed_sdp);
@@ -7165,6 +7192,25 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			json_decref(call);
 			json_decref(jsep);
 			janus_sdp_destroy(sdp);
+			/* If video was added in the 200 OK after an audio-only 183, fire a synthetic updatingcall
+			 * event with the 200 OK SDP as an offer so the client can renegotiate to add video. */
+			if(earlymedia_video_added) {
+				JANUS_LOG(LOG_VERB, "200 OK added video after audio-only 183, firing synthetic updatingcall\n");
+				session->media.earlymedia_video_recovery = TRUE;
+				janus_sip_call_update_status(session, janus_sip_call_status_incall_reinvited);
+				json_t *update_call = json_object();
+				json_object_set_new(update_call, "sip", json_string("event"));
+				json_t *update_result = json_object();
+				json_object_set_new(update_result, "event", json_string("updatingcall"));
+				json_object_set_new(update_result, "username", json_string(session->callee));
+				json_object_set_new(update_call, "result", update_result);
+				json_object_set_new(update_call, "call_id", json_string(session->callid));
+				json_t *update_jsep = json_pack("{ssss}", "type", "offer", "sdp", fixed_sdp);
+				int upd_ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, update_call, update_jsep);
+				JANUS_LOG(LOG_VERB, "  >> Pushing synthetic updatingcall to peer: %d (%s)\n", upd_ret, janus_get_api_error(upd_ret));
+				json_decref(update_call);
+				json_decref(update_jsep);
+			}
 			/* Also notify event handlers */
 			if(!session->media.update && notify_events && gateway->events_is_enabled()) {
 				json_t *info = json_object();

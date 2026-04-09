@@ -4746,7 +4746,7 @@ static void *janus_sip_handler(void *data) {
 				 * respond to; instead, send a re-INVITE to the remote peer to add video. */
 				JANUS_LOG(LOG_VERB, "earlymedia video recovery: converting answer into outgoing re-INVITE\n");
 				session->media.earlymedia_video_recovery = FALSE;
-				session->media.update = TRUE;
+				session->media.update = FALSE;
 				janus_sip_call_update_status(session, janus_sip_call_status_incall);
 				char *contact_header = janus_sip_session_contact_header_retrieve(session);
 				nua_invite(session->stack->s_nh_i,
@@ -6386,22 +6386,46 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				}
 			}
 			if(reinvite && session->media.autoaccept_reinvites) {
-				/* If earlymedia_video_recovery is set and this re-INVITE adds video, we must forward
-				 * it to the browser so WebRTC can renegotiate and enable the video track.  When
-				 * PortaSwitch sends an audio-only 183 followed by an audio-only 200 OK and then a
-				 * re-INVITE with video, auto-accepting would leave the browser with an audio-only
-				 * PeerConnection and no way to receive the remote video stream. */
 				if(session->media.earlymedia_video_recovery && session->media.remote_video_rtp_port > 0) {
-					JANUS_LOG(LOG_VERB, "earlymedia_video_recovery: bypassing auto-accept, "
-						"re-INVITE adds video (port=%d)\n", session->media.remote_video_rtp_port);
-					session->media.earlymedia_video_recovery = FALSE;
-					/* Fall through to the normal updatingcall path below */
-				} else {
-					/* No need to involve the application: we reply ourselves */
+					/* Video is being added via re-INVITE after audio-only early media (PortaSwitch
+					 * pattern). Auto-accept the re-INVITE immediately so audio keeps working — the
+					 * relay thread was already signalled by janus_sip_sdp_process (media.updated=TRUE)
+					 * to reconnect sockets to the new remote ports. Then fire a synthetic updatingcall
+					 * so the browser can renegotiate WebRTC and enable its video track. When the browser
+					 * answers, the update handler will send an outgoing re-INVITE to PortaSwitch. */
+					JANUS_LOG(LOG_VERB, "earlymedia_video_recovery: auto-accepting re-INVITE with video "
+						"(port=%d) and firing synthetic updatingcall\n", session->media.remote_video_rtp_port);
+					char *reinvite_sdp = janus_sdp_write(sdp);
+					/* SIP side: respond immediately to keep audio working */
 					nua_respond(nh, 200, sip_status_phrase(200), TAG_END());
 					janus_sdp_destroy(sdp);
+					/* Transition so the update handler will accept the browser's answer */
+					janus_sip_call_update_status(session, janus_sip_call_status_incall_reinvited);
+					/* WebRTC side: notify browser to add video */
+					if(reinvite_sdp) {
+						json_t *call = json_object();
+						json_object_set_new(call, "sip", json_string("event"));
+						json_t *result = json_object();
+						json_object_set_new(result, "event", json_string("updatingcall"));
+						json_object_set_new(result, "username", json_string(session->callee));
+						json_object_set_new(call, "result", result);
+						if(session->callid)
+							json_object_set_new(call, "call_id", json_string(session->callid));
+						json_t *jsep = json_pack("{ssss}", "type", "offer", "sdp", reinvite_sdp);
+						g_free(reinvite_sdp);
+						int ret = gateway->push_event(session->handle, &janus_sip_plugin,
+							session->transaction, call, jsep);
+						JANUS_LOG(LOG_VERB, "  >> Pushing earlymedia video recovery updatingcall: "
+							"%d (%s)\n", ret, janus_get_api_error(ret));
+						json_decref(call);
+						json_decref(jsep);
+					}
 					break;
 				}
+				/* No need to involve the application: we reply ourselves */
+				nua_respond(nh, 200, sip_status_phrase(200), TAG_END());
+				janus_sdp_destroy(sdp);
+				break;
 			}
 			/* Check if there's an isfocus feature parameter in the Contact header */
 			gboolean is_focus = FALSE;
@@ -7177,10 +7201,12 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			/* Send event back to the application */
 			/* Detect if 200 OK added video that was absent in audio-only 183 */
 			gboolean earlymedia_video_added = (!in_progress && session->media.earlymedia &&
+				session->media.local_video_rtp_port > 0 &&
 				pre_sdp_process_remote_video_rtp_port == 0 && session->media.remote_video_rtp_port != 0);
 			/* Detect if 200 OK still has no video after audio-only 183 (PortaSwitch pattern:
 			 * keeps the early media SDP in the 200 OK and adds video via a follow-up re-INVITE) */
 			gboolean earlymedia_video_still_pending = (!in_progress && session->media.earlymedia &&
+				session->media.local_video_rtp_port > 0 &&
 				pre_sdp_process_remote_video_rtp_port == 0 && session->media.remote_video_rtp_port == 0);
 			json_t *jsep = NULL;
 			if(!session->media.earlymedia) {

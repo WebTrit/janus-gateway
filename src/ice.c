@@ -3913,11 +3913,12 @@ void janus_ice_restart(janus_ice_handle *handle) {
 		 * renegotiation_info. The existing connected SSL* rejects this with a fatal
 		 * handshake_failure alert, leaving DTLS stuck in connecting state.
 		 *
-		 * Hold handle->mutex for the entire destroy/create sequence, matching the pattern
-		 * used by janus_ice_webrtc_free(). This serializes against concurrent signaling-thread
-		 * operations (e.g. janus_ice_webrtc_hangup) that also acquire handle->mutex before
-		 * touching pc->dtls. */
-		janus_mutex_lock(&handle->mutex);
+		 * Note: janus_mutex is non-recursive. This function is called from two sites in
+		 * janus.c: one with handle->mutex already held (janus.c:1685) and one without
+		 * (janus.c:4091). We do NOT acquire the mutex here to avoid deadlocking the first
+		 * caller. The race with janus_ice_cb_nice_recv is mitigated by the refcount pattern
+		 * in that callback (see dtls_recreate_on_ice_restart guard there) and by the atomic
+		 * destroyed flag in janus_dtls_srtp_destroy(). */
 		if(pc->dtlsrt_source != NULL) {
 			g_source_destroy(pc->dtlsrt_source);
 			g_source_unref(pc->dtlsrt_source);
@@ -3931,7 +3932,6 @@ void janus_ice_restart(janus_ice_handle *handle) {
 		pc->dtls = janus_dtls_srtp_create(pc, pc->dtls_role);
 		if(!pc->dtls) {
 			JANUS_LOG(LOG_ERR, "[%"SCNu64"] Error recreating DTLS-SRTP stack on ICE restart...\n", handle->handle_id);
-			janus_mutex_unlock(&handle->mutex);
 			janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
 			janus_ice_webrtc_hangup(handle, "DTLS-SRTP stack error on ICE restart");
 			return;
@@ -3941,7 +3941,6 @@ void janus_ice_restart(janus_ice_handle *handle) {
 		 * reconnects. Without this, the guard in janus_ice_cb_nice_ready prevents
 		 * re-entering the handshake path after an ICE restart. */
 		pc->connected = 0;
-		janus_mutex_unlock(&handle->mutex);
 	}
 	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
 }

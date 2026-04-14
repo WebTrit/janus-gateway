@@ -187,6 +187,21 @@ gboolean janus_ice_is_hangup_on_failed_enabled(void) {
 	return janus_ice_hangup_on_failed;
 }
 
+/* Whether to recreate the DTLS stack on ICE restart. When a peer's process is killed
+ * during an active call and reconnects via ICE restart, the existing SSL* object rejects
+ * the fresh ClientHello as an RFC 5746 renegotiation, leaving DTLS stuck. Enabling this
+ * destroys and recreates the DTLS stack on ICE restart so the new handshake completes. */
+static gboolean dtls_recreate_on_ice_restart = FALSE;
+void janus_ice_set_dtls_recreate_on_ice_restart_enabled(gboolean enabled) {
+	dtls_recreate_on_ice_restart = enabled;
+	if(dtls_recreate_on_ice_restart) {
+		JANUS_LOG(LOG_INFO, "Will recreate DTLS stack on ICE restart\n");
+	}
+}
+gboolean janus_ice_is_dtls_recreate_on_ice_restart_enabled(void) {
+	return dtls_recreate_on_ice_restart;
+}
+
 /* Opaque IDs set by applications are by default only passed to event handlers
  * for correlation purposes, but not sent back to the user or application in
  * the related Janus API responses or events, unless configured otherwise */
@@ -2592,7 +2607,20 @@ static void janus_ice_cb_nice_recv(NiceAgent *agent, guint stream_id, guint comp
 	if(janus_is_dtls(buf) || (!janus_is_rtp(buf, len) && !janus_is_rtcp(buf, len))) {
 		/* This is DTLS: either handshake stuff, or data coming from SCTP DataChannels */
 		JANUS_LOG(LOG_HUGE, "[%"SCNu64"] Looks like DTLS!\n", handle->handle_id);
-		janus_dtls_srtp_incoming_msg(pc->dtls, buf, len);
+		/* When dtls_recreate_on_ice_restart is enabled, take a short-lived reference on
+		 * pc->dtls before calling into it. janus_ice_restart() may destroy and recreate
+		 * pc->dtls on the signaling thread; holding a reference prevents the memory from
+		 * being freed while janus_dtls_srtp_incoming_msg() is still executing. */
+		if(dtls_recreate_on_ice_restart) {
+			janus_dtls_srtp *dtls = pc->dtls;
+			if(dtls) {
+				janus_refcount_increase(&dtls->ref);
+				janus_dtls_srtp_incoming_msg(dtls, buf, len);
+				janus_refcount_decrease(&dtls->ref);
+			}
+		} else {
+			janus_dtls_srtp_incoming_msg(pc->dtls, buf, len);
+		}
 		/* Update stats (TODO Do the same for the last second window as well) */
 		pc->dtls_in_stats.info[0].packets++;
 		pc->dtls_in_stats.info[0].bytes += len;
@@ -3878,33 +3906,43 @@ void janus_ice_restart(janus_ice_handle *handle) {
 	if(nice_agent_restart(handle->agent) == FALSE) {
 		JANUS_LOG(LOG_WARN, "[%"SCNu64"] ICE restart failed...\n", handle->handle_id);
 	}
-	/* Recreate the DTLS context so a fresh ClientHello from the peer is treated as a new
-	 * handshake rather than RFC 5746 renegotiation. When the peer creates a new
-	 * RTCPeerConnection (e.g. after app restart), it sends a ClientHello with no
-	 * renegotiation_info. The existing connected SSL* rejects this with a fatal
-	 * handshake_failure alert, leaving DTLS stuck in connecting state. */
-	if(pc->dtlsrt_source != NULL) {
-		g_source_destroy(pc->dtlsrt_source);
-		g_source_unref(pc->dtlsrt_source);
-		pc->dtlsrt_source = NULL;
+	if(dtls_recreate_on_ice_restart) {
+		/* Recreate the DTLS context so a fresh ClientHello from the peer is treated as a new
+		 * handshake rather than RFC 5746 renegotiation. When the peer creates a new
+		 * RTCPeerConnection (e.g. after app restart), it sends a ClientHello with no
+		 * renegotiation_info. The existing connected SSL* rejects this with a fatal
+		 * handshake_failure alert, leaving DTLS stuck in connecting state.
+		 *
+		 * Hold handle->mutex for the entire destroy/create sequence, matching the pattern
+		 * used by janus_ice_webrtc_free(). This serializes against concurrent signaling-thread
+		 * operations (e.g. janus_ice_webrtc_hangup) that also acquire handle->mutex before
+		 * touching pc->dtls. */
+		janus_mutex_lock(&handle->mutex);
+		if(pc->dtlsrt_source != NULL) {
+			g_source_destroy(pc->dtlsrt_source);
+			g_source_unref(pc->dtlsrt_source);
+			pc->dtlsrt_source = NULL;
+		}
+		if(pc->dtls != NULL) {
+			janus_dtls_srtp_destroy(pc->dtls);
+			janus_refcount_decrease(&pc->dtls->ref);
+			pc->dtls = NULL;
+		}
+		pc->dtls = janus_dtls_srtp_create(pc, pc->dtls_role);
+		if(!pc->dtls) {
+			JANUS_LOG(LOG_ERR, "[%"SCNu64"] Error recreating DTLS-SRTP stack on ICE restart...\n", handle->handle_id);
+			janus_mutex_unlock(&handle->mutex);
+			janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
+			janus_ice_webrtc_hangup(handle, "DTLS-SRTP stack error on ICE restart");
+			return;
+		}
+		janus_refcount_increase(&pc->dtls->ref);
+		/* Reset pc->connected so the DTLS handshake is triggered again when ICE
+		 * reconnects. Without this, the guard in janus_ice_cb_nice_ready prevents
+		 * re-entering the handshake path after an ICE restart. */
+		pc->connected = 0;
+		janus_mutex_unlock(&handle->mutex);
 	}
-	if(pc->dtls != NULL) {
-		janus_dtls_srtp_destroy(pc->dtls);
-		janus_refcount_decrease(&pc->dtls->ref);
-		pc->dtls = NULL;
-	}
-	pc->dtls = janus_dtls_srtp_create(pc, pc->dtls_role);
-	if(!pc->dtls) {
-		JANUS_LOG(LOG_ERR, "[%"SCNu64"] Error recreating DTLS-SRTP stack on ICE restart...\n", handle->handle_id);
-		janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
-		janus_ice_webrtc_hangup(handle, "DTLS-SRTP stack error on ICE restart");
-		return;
-	}
-	janus_refcount_increase(&pc->dtls->ref);
-	/* Reset pc->connected so the DTLS handshake is triggered again when ICE
-	 * reconnects. Without this, the guard in janus_ice_cb_nice_ready prevents
-	 * re-entering the handshake path after an ICE restart. */
-	pc->connected = 0;
 	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
 }
 

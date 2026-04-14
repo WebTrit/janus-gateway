@@ -174,6 +174,12 @@ void janus_ice_set_hangup_on_failed_enabled(gboolean enabled);
 /*! \brief Method to check whether ICE failures will result in immediate hangups
  * @returns true if enabled, false (default) otherwise */
 gboolean janus_ice_is_hangup_on_failed_enabled(void);
+/*! \brief Method to enable/disable DTLS recreation on ICE restart
+ * @param[in] enabled Whether DTLS should be recreated on ICE restart */
+void janus_ice_set_dtls_recreate_on_ice_restart_enabled(gboolean enabled);
+/*! \brief Method to check whether DTLS recreation on ICE restart is enabled
+ * @returns true if enabled, false (default) otherwise */
+gboolean janus_ice_is_dtls_recreate_on_ice_restart_enabled(void);
 /*! \brief Method to modify the min NACK value (i.e., the minimum time window of packets per handle to store for retransmissions)
  * @param[in] mnq The new min NACK value */
 void janus_set_min_nack_queue(uint16_t mnq);

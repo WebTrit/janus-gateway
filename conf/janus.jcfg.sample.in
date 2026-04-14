@@ -302,6 +302,15 @@ nat: {
 	# by uncommenting the following property and set it to true
 	#hangup_on_failed = true
 
+	# When a peer's process is killed during an active call (e.g., app crash or OS
+	# kill) and reconnects via ICE restart (re-INVITE / UpdateRequest), the existing
+	# SSL* object in Janus rejects the fresh DTLS ClientHello as an RFC 5746
+	# renegotiation (verify_data mismatch), leaving DTLS stuck in connecting state
+	# and resulting in no audio after restoration. Enabling this option destroys and
+	# recreates the DTLS stack inside janus_ice_restart() so the new handshake
+	# completes successfully. Disabled by default (vanilla Janus behavior).
+	#dtls_recreate_on_ice_restart = false
+
 	# By default Janus tries to resolve mDNS (.local) candidates: even
 	# though this is now done asynchronously and shouldn't keep the API
 	# busy, even in case mDNS resolution takes a long time to timeout,

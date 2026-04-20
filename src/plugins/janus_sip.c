@@ -1255,9 +1255,10 @@ typedef struct janus_sip_media {
 	char *remote_video_ip;			/* Peer video media IP address */
 	gboolean earlymedia;
 	gboolean earlymedia_video_recovery;	/* TRUE when video needs to be recovered after audio-only early media:
-	 *   Case A: 200 OK added video vs audio-only 183 → synthetic updatingcall fired, then outgoing re-INVITE
-	 *   Case B: 200 OK still has video=0 (PortaSwitch pattern) → incoming re-INVITE with video must bypass
-	 *           auto-accept so the browser can renegotiate and enable the video track */
+	 *   Case A: 200 OK added video vs audio-only 183 → synthetic updatingcall fired; browser answer
+	 *           requires no SIP action (video already flowing from relay thread via 200 OK)
+	 *   Case B: 200 OK still has video=0 (PortaSwitch pattern) → incoming re-INVITE with video must
+	 *           bypass auto-accept so the browser can renegotiate and answer with a proper SDP */
 	gboolean update;
 	gboolean autoaccept_reinvites;
 	gboolean ready;
@@ -4742,18 +4743,16 @@ static void *janus_sip_handler(void *data) {
 			session->media.update = offer;
 			JANUS_LOG(LOG_VERB, "Prepared SDP for update:\n%s", sdp);
 			if(session->media.earlymedia_video_recovery && !offer) {
-				/* This is the client's answer to our synthetic updatingcall (video recovery after
-				 * audio-only 183 followed by 200 OK with video). There is no incoming re-INVITE to
-				 * respond to; instead, send a re-INVITE to the remote peer to add video. */
-				JANUS_LOG(LOG_VERB, "earlymedia video recovery: converting answer into outgoing re-INVITE\n");
+				/* Case A: browser answered the synthetic updatingcall fired after an audio-only 183
+				 * followed by a 200 OK that added video.  The relay thread already learned the video
+				 * endpoints from janus_sip_sdp_process(200 OK) and reconnected its sockets, so video
+				 * RTP is already flowing between Janus and PortaSwitch.  No SIP action needed here —
+				 * just clear the flag and transition back to incall. */
+				JANUS_LOG(LOG_VERB, "earlymedia video recovery (Case A): browser answered updatingcall, "
+					"video already active via relay thread — no SIP re-INVITE needed\n");
 				session->media.earlymedia_video_recovery = FALSE;
 				session->media.update = FALSE;
 				janus_sip_call_update_status(session, janus_sip_call_status_incall);
-				char *contact_header = janus_sip_session_contact_header_retrieve(session);
-				nua_invite(session->stack->s_nh_i,
-					TAG_IF(contact_header != NULL, SIPTAG_CONTACT_STR(contact_header)),
-					SOATAG_USER_SDP_STR(sdp),
-					TAG_END());
 			} else if(session->status == janus_sip_call_status_incall) {
 				/* Retrieve the Contact header for manually adding if not NULL */
 				char *contact_header = janus_sip_session_contact_header_retrieve(session);
@@ -6387,46 +6386,24 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				}
 			}
 			if(reinvite && session->media.autoaccept_reinvites) {
-				if(session->media.earlymedia_video_recovery && session->media.remote_video_rtp_port > 0) {
-					/* Video is being added via re-INVITE after audio-only early media (PortaSwitch
-					 * pattern). Auto-accept the re-INVITE immediately so audio keeps working — the
-					 * relay thread was already signalled by janus_sip_sdp_process (media.updated=TRUE)
-					 * to reconnect sockets to the new remote ports. Then fire a synthetic updatingcall
-					 * so the browser can renegotiate WebRTC and enable its video track. When the browser
-					 * answers, the update handler will send an outgoing re-INVITE to PortaSwitch. */
-					JANUS_LOG(LOG_VERB, "earlymedia_video_recovery: auto-accepting re-INVITE with video "
-						"(port=%d) and firing synthetic updatingcall\n", session->media.remote_video_rtp_port);
-					char *reinvite_sdp = janus_sdp_write(sdp);
-					/* SIP side: respond immediately to keep audio working */
+				if(session->media.earlymedia_video_recovery) {
+					/* Case B: re-INVITE is adding video after audio-only early media (PortaSwitch
+					 * pattern).  Do NOT auto-accept blindly — the browser must renegotiate WebRTC to
+					 * activate its video transceiver and produce a proper SDP answer.  Clear the flag
+					 * and fall through to the normal re-INVITE handling path below, which will send
+					 * an updatingcall to the browser; the browser's update answer will call
+					 * nua_respond(200, sdp) with the correct SDP body. */
+					JANUS_LOG(LOG_VERB, "earlymedia_video_recovery (Case B): re-INVITE adds video "
+						"(port=%d), bypassing auto-accept, forwarding to browser\n",
+						session->media.remote_video_rtp_port);
+					session->media.earlymedia_video_recovery = FALSE;
+					/* fall through */
+				} else {
+					/* No need to involve the application: we reply ourselves */
 					nua_respond(nh, 200, sip_status_phrase(200), TAG_END());
 					janus_sdp_destroy(sdp);
-					/* Transition so the update handler will accept the browser's answer */
-					janus_sip_call_update_status(session, janus_sip_call_status_incall_reinvited);
-					/* WebRTC side: notify browser to add video */
-					if(reinvite_sdp) {
-						json_t *call = json_object();
-						json_object_set_new(call, "sip", json_string("event"));
-						json_t *result = json_object();
-						json_object_set_new(result, "event", json_string("updatingcall"));
-						json_object_set_new(result, "username", json_string(session->callee));
-						json_object_set_new(call, "result", result);
-						if(session->callid)
-							json_object_set_new(call, "call_id", json_string(session->callid));
-						json_t *jsep = json_pack("{ssss}", "type", "offer", "sdp", reinvite_sdp);
-						g_free(reinvite_sdp);
-						int ret = gateway->push_event(session->handle, &janus_sip_plugin,
-							session->transaction, call, jsep);
-						JANUS_LOG(LOG_VERB, "  >> Pushing earlymedia video recovery updatingcall: "
-							"%d (%s)\n", ret, janus_get_api_error(ret));
-						json_decref(call);
-						json_decref(jsep);
-					}
 					break;
 				}
-				/* No need to involve the application: we reply ourselves */
-				nua_respond(nh, 200, sip_status_phrase(200), TAG_END());
-				janus_sdp_destroy(sdp);
-				break;
 			}
 			/* Check if there's an isfocus feature parameter in the Contact header */
 			gboolean is_focus = FALSE;
@@ -6443,6 +6420,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			/* If this is a re-INVITE, take note of that */
 			if(reinvite) {
 				session->media.update = TRUE;
+				/* A real incoming re-INVITE is now being forwarded to the browser for a proper SDP
+				 * answer.  Clear the earlymedia_video_recovery flag so the update handler knows it
+				 * must call nua_respond(200, sdp) rather than taking no SIP action (Case A). */
+				session->media.earlymedia_video_recovery = FALSE;
 				/* Mark status as janus_sip_call_status_incall_reinvited only when handling reinvites ourselves*/
 				janus_sip_call_update_status(session, janus_sip_call_status_incall_reinvited);
 			}

@@ -1844,6 +1844,7 @@ void janus_sip_save_reason(sip_t const *sip, janus_sip_session *session);
 /* SDP parsing and manipulation */
 void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean answer, gboolean update, gboolean *changed);
 char *janus_sip_sdp_manipulate(janus_sip_session *session, janus_sdp *sdp, gboolean answer);
+char *janus_sip_sdp_restore_video_for_earlymedia(const char *sdp);
 /* Media */
 static int janus_sip_allocate_local_ports(janus_sip_session *session, gboolean update);
 static void *janus_sip_relay_thread(void *data);
@@ -7210,7 +7211,25 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				pre_sdp_process_remote_video_rtp_port == 0 && session->media.remote_video_rtp_port == 0);
 			json_t *jsep = NULL;
 			if(!session->media.earlymedia) {
-				jsep = json_pack("{ssss}", "type", "answer", "sdp", fixed_sdp);
+				/* When this is a 183 Early Media response (in_progress) and the SDP contains
+				 * "m=video 0" (RFC 3264 temporary video rejection), patch the SDP before sending
+				 * it to the browser.  Port 0 causes the browser's RTCRtpTransceiver to enter the
+				 * "stopped" state permanently, which prevents video recovery after a re-INVITE.
+				 * We replace the port with 9 and set a=inactive so the transceiver stays alive. */
+				char *progress_sdp = NULL;
+				gboolean progress_sdp_patched = FALSE;
+				if(in_progress && session->media.local_video_rtp_port > 0) {
+					char *patched = janus_sip_sdp_restore_video_for_earlymedia(fixed_sdp);
+					if(patched && patched != fixed_sdp) {
+						JANUS_LOG(LOG_VERB, "Patched m=video 0 → m=video 9 a=inactive in 183 Early Media SDP "
+							"to keep browser video transceiver alive\n");
+						progress_sdp = patched;
+						progress_sdp_patched = TRUE;
+					}
+				}
+				jsep = json_pack("{ssss}", "type", "answer", "sdp", progress_sdp ? progress_sdp : fixed_sdp);
+				if(progress_sdp_patched)
+					g_free(progress_sdp);
 			} else {
 				/* We've received the 200 OK after the 183, we can remove the flag now */
 				session->media.earlymedia = FALSE;
@@ -7902,7 +7921,115 @@ char *janus_sip_sdp_manipulate(janus_sip_session *session, janus_sdp *sdp, gbool
 	return janus_sdp_write(sdp);
 }
 
- /* Bind local RTP/RTCP sockets */
+/* When a SIP 183 Early Media response contains "m=video 0" (RFC 3264 temporary rejection),
+ * the browser interprets it as a permanently stopped transceiver.  To prevent that, we patch
+ * the SDP before sending the JSEP to the browser:
+ *   - Replace "m=video 0 " → "m=video 9 " (port 0 → port 9, keeping proto and formats)
+ *   - Ensure the video m-section has exactly "a=inactive" as its direction attribute
+ *     (replacing sendrecv / sendonly / recvonly if present, or inserting it if absent)
+ * The browser keeps the transceiver alive in the "inactive" state and can recover it when
+ * a subsequent re-INVITE brings real video. Returns a newly-allocated string that the caller
+ * must g_free(), or NULL on allocation failure.  If the SDP does not contain "m=video 0 "
+ * the original string is returned as-is (no allocation). */
+char *janus_sip_sdp_restore_video_for_earlymedia(const char *sdp) {
+	if(!sdp)
+		return NULL;
+
+	/* Quick check: does the SDP contain "m=video 0 "? */
+	const char *video_line = strstr(sdp, "\nm=video 0 ");
+	if(!video_line)
+		video_line = strstr(sdp, "\r\nm=video 0 ");
+	if(!video_line)
+		return (char *)sdp;		/* Nothing to do; caller must NOT g_free this */
+
+	/* We need to build a new SDP string.  We work on a GString for simplicity. */
+	GString *out = g_string_sized_new(strlen(sdp) + 64);
+	if(!out)
+		return NULL;
+
+	const char *pos = sdp;
+	/* Detect line-ending style once (CRLF vs LF). */
+	gboolean crlf = (strstr(sdp, "\r\n") != NULL);
+	const char *eol = crlf ? "\r\n" : "\n";
+
+	/* Scan the SDP line by line, applying patches inside the video m-section. */
+	gboolean in_video_section = FALSE;
+	gboolean direction_set = FALSE;
+
+	while(*pos) {
+		/* Find end of current line */
+		const char *lf = strchr(pos, '\n');
+		const char *line_end;
+		if(lf) {
+			line_end = lf + 1;		/* points past the '\n' */
+		} else {
+			line_end = pos + strlen(pos);	/* last line with no trailing newline */
+		}
+		size_t line_len = line_end - pos;
+
+		/* Determine content length (strip trailing \r\n / \n for comparisons) */
+		size_t content_len = line_len;
+		if(content_len > 0 && pos[content_len - 1] == '\n') content_len--;
+		if(content_len > 0 && pos[content_len - 1] == '\r') content_len--;
+
+		/* Detect the start of a new m= section */
+		if(content_len >= 2 && pos[0] == 'm' && pos[1] == '=') {
+			if(in_video_section && !direction_set) {
+				/* We were in the video section and never wrote a direction attribute — add one */
+				g_string_append(out, "a=inactive");
+				g_string_append(out, eol);
+			}
+			in_video_section = FALSE;
+			direction_set = FALSE;
+
+			/* Is this the video m-line with port 0? */
+			if(content_len > 8 && strncmp(pos, "m=video 0 ", 10) == 0) {
+				/* Emit "m=video 9 " and copy the rest of the m= line */
+				g_string_append(out, "m=video 9 ");
+				/* Copy the part after "m=video 0 " (i.e., proto + formats) */
+				const char *rest = pos + 10;
+				/* Write up to end of content, then the original line ending */
+				g_string_append_len(out, rest, content_len - 10);
+				g_string_append(out, eol);
+				in_video_section = TRUE;
+				direction_set = FALSE;
+				pos = line_end;
+				continue;
+			}
+		}
+
+		/* Inside the video section: replace any direction attribute with a=inactive */
+		if(in_video_section && content_len == 10 &&
+		   (strncmp(pos, "a=sendrecv", 10) == 0 ||
+		    strncmp(pos, "a=sendonly", 10) == 0 ||
+		    strncmp(pos, "a=recvonly", 10) == 0)) {
+			g_string_append(out, "a=inactive");
+			g_string_append(out, eol);
+			direction_set = TRUE;
+			pos = line_end;
+			continue;
+		}
+		if(in_video_section && content_len == 10 && strncmp(pos, "a=inactive", 10) == 0) {
+			/* Already inactive — pass through and mark done */
+			direction_set = TRUE;
+		}
+
+		/* Default: copy line as-is */
+		g_string_append_len(out, pos, line_len);
+		pos = line_end;
+	}
+
+	/* If the SDP ended while still inside the video section without a direction attr */
+	if(in_video_section && !direction_set) {
+		g_string_append(out, "a=inactive");
+		g_string_append(out, eol);
+	}
+
+	char *result = g_string_free(out, FALSE);
+	return result;
+}
+
+/* Bind local RTP/RTCP sockets */
 static int janus_sip_allocate_local_ports(janus_sip_session *session, gboolean update) {
 	if(session == NULL) {
 		JANUS_LOG(LOG_ERR, "Invalid session\n");

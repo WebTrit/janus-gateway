@@ -7634,6 +7634,8 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 				session->media.remote_audio_rtp_port = m->port;
 				session->media.remote_audio_rtcp_port = m->port+1;	/* FIXME We're assuming RTCP is on the next port */
 				session->media.dtmf_pt = janus_sdp_get_codec_pt(sdp, -1, "dtmf");
+				gboolean prev_audio_send = session->media.audio_send;
+				gboolean prev_audio_recv = session->media.audio_recv;
 				if(m->direction == JANUS_SDP_SENDONLY || m->direction == JANUS_SDP_INACTIVE)
 					session->media.audio_send = FALSE;
 				else
@@ -7642,6 +7644,8 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 					session->media.audio_recv = FALSE;
 				else
 					session->media.audio_recv = TRUE;
+				if(update && changed && (session->media.audio_send != prev_audio_send || session->media.audio_recv != prev_audio_recv))
+					*changed = TRUE;
 			} else {
 				session->media.audio_send = FALSE;
 				session->media.audio_recv = FALSE;
@@ -7656,6 +7660,8 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 				session->media.has_video = TRUE;
 				session->media.remote_video_rtp_port = m->port;
 				session->media.remote_video_rtcp_port = m->port+1;	/* FIXME We're assuming RTCP is on the next port */
+				gboolean prev_video_send = session->media.video_send;
+				gboolean prev_video_recv = session->media.video_recv;
 				if(m->direction == JANUS_SDP_SENDONLY || m->direction == JANUS_SDP_INACTIVE)
 					session->media.video_send = FALSE;
 				else
@@ -7664,6 +7670,8 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 					session->media.video_recv = FALSE;
 				else
 					session->media.video_recv = TRUE;
+				if(update && changed && (session->media.video_send != prev_video_send || session->media.video_recv != prev_video_recv))
+					*changed = TRUE;
 			} else {
 				session->media.video_send = FALSE;
 				session->media.video_recv = FALSE;

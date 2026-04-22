@@ -6384,6 +6384,20 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					}
 					ml = next;
 				}
+				/* For incoming re-INVITEs that changed the remote RTP port or address,
+				 * wake the relay thread so it reconnects its UDP sockets to the new
+				 * peer endpoint.  Without this, sockets stay connected to the stale
+				 * address after hold/unhold cycles that change the SIP peer's media port. */
+				if(reinvite && changed) {
+					session->media.updated = TRUE;
+					if(session->media.pipefd[1] > 0) {
+						int code = 1;
+						ssize_t res = 0;
+						do {
+							res = write(session->media.pipefd[1], &code, sizeof(int));
+						} while(res == -1 && errno == EINTR);
+					}
+				}
 			}
 			if(reinvite && session->media.autoaccept_reinvites) {
 				if(session->media.earlymedia_video_recovery) {

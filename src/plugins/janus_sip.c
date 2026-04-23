@@ -1293,6 +1293,7 @@ typedef struct janus_sip_media {
 	srtp_policy_t video_remote_policy, video_local_policy;
 	char *video_srtp_local_profile, *video_srtp_local_crypto;
 	gboolean video_send, video_recv;
+	gboolean video_recv_pli_pending;
 	gboolean video_pli_supported;
 	janus_sdp_mdirection hold_video_dir, pre_hold_video_dir;
 	janus_rtp_switching_context acontext, vcontext;
@@ -1816,6 +1817,7 @@ static void janus_sip_media_reset(janus_sip_session *session) {
 	session->media.video_pt_name = NULL;	/* Immutable string, no need to free*/
 	session->media.video_send = TRUE;
 	session->media.video_recv = TRUE;
+	session->media.video_recv_pli_pending = FALSE;
 	session->media.video_pli_supported = FALSE;
 	session->media.hold_video_dir = JANUS_SDP_SENDONLY;
 	session->media.pre_hold_video_dir = JANUS_SDP_DEFAULT;
@@ -8474,17 +8476,21 @@ static void *janus_sip_relay_thread(void *data) {
 				session->media.video_recv = FALSE;
 			}
 
-			/* After reconnecting sockets, request keyframes to recover video after
-			 * hold/unhold where the video socket was completely idle (both send and
-			 * recv were FALSE / INACTIVE). The first keyframe after unhold may have
-			 * been sent before the socket was reconnected here; a PLI ensures the
-			 * receiving side can recover without waiting for the next IDR. */
+			/* After reconnecting sockets, request keyframes to recover video.
+			 * For the browser→SIP direction (video_send), send PLI immediately since
+			 * the browser responds right away.  For the SIP→browser direction
+			 * (video_recv), defer the PLI until the first RTP packet is actually
+			 * received from the SIP peer: sending it here races against PortaSIP
+			 * resuming its media path (especially after hold/unhold where PortaSIP
+			 * itself may need to signal the far leg before it starts forwarding).
+			 * The deferred path in the video-RTP receive section clears the flag and
+			 * sends the PLI only once PortaSIP is confirmed sending. */
 			if(have_video_server_ip && session->media.has_video &&
 					session->media.video_ssrc_peer != 0) {
 				if(session->media.video_send)
 					gateway->send_pli(session->handle);
-				if(session->media.video_recv && session->media.video_rtcp_fd != -1)
-					janus_sip_rtcp_pli_send(session);
+				if(session->media.video_recv)
+					session->media.video_recv_pli_pending = TRUE;
 			}
 		}
 
@@ -8556,22 +8562,17 @@ static void *janus_sip_relay_thread(void *data) {
 					/* Maybe not a breaking error after all? */
 					continue;
 				} else if(error == 111) {
-					/* ICMP error? If it's related to RTCP, let's just close the RTCP socket and move on */
+					/* ICMP port-unreachable on an RTCP socket: this can happen during
+					 * hold when the far end closes its RTCP port.  Keep the socket open
+					 * so it can be reused (and reconnected by janus_sip_connect_sockets)
+					 * on unhold, which is required for the deferred PLI to work. */
 					if(fds[i].fd == session->media.audio_rtcp_fd) {
-						JANUS_LOG(LOG_WARN, "[SIP-%s] Got a '%s' on the audio RTCP socket, closing it\n",
+						JANUS_LOG(LOG_WARN, "[SIP-%s] Got a '%s' on the audio RTCP socket, ignoring\n",
 							session->account.username, g_strerror(error));
-						janus_mutex_lock(&session->mutex);
-						close(session->media.audio_rtcp_fd);
-						session->media.audio_rtcp_fd = -1;
-						janus_mutex_unlock(&session->mutex);
 						continue;
 					} else if(fds[i].fd == session->media.video_rtcp_fd) {
-						JANUS_LOG(LOG_WARN, "[SIP-%s] Got a '%s' on the video RTCP socket, closing it\n",
+						JANUS_LOG(LOG_WARN, "[SIP-%s] Got a '%s' on the video RTCP socket, ignoring\n",
 							session->account.username, g_strerror(error));
-						janus_mutex_lock(&session->mutex);
-						close(session->media.video_rtcp_fd);
-						session->media.video_rtcp_fd = -1;
-						janus_mutex_unlock(&session->mutex);
 						continue;
 					}
 				}
@@ -8707,6 +8708,13 @@ static void *janus_sip_relay_thread(void *data) {
 					if(session->media.video_ssrc_peer == 0) {
 						session->media.video_ssrc_peer = ntohl(header->ssrc);
 						JANUS_LOG(LOG_VERB, "Got SIP peer video SSRC: %"SCNu32"\n", session->media.video_ssrc_peer);
+					}
+					/* Deferred PLI: send once the first video packet confirms PortaSIP
+					 * is actually forwarding (set in media.updated on unhold/reconnect). */
+					if(session->media.video_recv_pli_pending) {
+						session->media.video_recv_pli_pending = FALSE;
+						if(session->media.video_rtcp_fd != -1)
+							janus_sip_rtcp_pli_send(session);
 					}
 					/* Is this SRTP? */
 					if(session->media.has_srtp_remote_video) {

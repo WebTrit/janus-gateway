@@ -8473,6 +8473,19 @@ static void *janus_sip_relay_thread(void *data) {
 				session->media.video_send = FALSE;
 				session->media.video_recv = FALSE;
 			}
+
+			/* After reconnecting sockets, request keyframes to recover video after
+			 * hold/unhold where the video socket was completely idle (both send and
+			 * recv were FALSE / INACTIVE). The first keyframe after unhold may have
+			 * been sent before the socket was reconnected here; a PLI ensures the
+			 * receiving side can recover without waiting for the next IDR. */
+			if(have_video_server_ip && session->media.has_video &&
+					session->media.video_ssrc_peer != 0) {
+				if(session->media.video_send)
+					gateway->send_pli(session->handle);
+				if(session->media.video_recv && session->media.video_rtcp_fd != -1)
+					janus_sip_rtcp_pli_send(session);
+			}
 		}
 
 		/* Prepare poll */

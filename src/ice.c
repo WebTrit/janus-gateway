@@ -187,6 +187,22 @@ gboolean janus_ice_is_hangup_on_failed_enabled(void) {
 	return janus_ice_hangup_on_failed;
 }
 
+/* Whether to recreate the DTLS stack on ICE restart. When a peer's process is killed
+ * during an active call and reconnects via ICE restart, the existing SSL* object rejects
+ * the fresh ClientHello as an RFC 5746 renegotiation, leaving DTLS stuck. Enabling this
+ * destroys and recreates the DTLS stack on ICE restart so the new handshake completes. */
+static gboolean dtls_recreate_on_ice_restart = FALSE;
+
+void janus_ice_set_dtls_recreate_on_ice_restart_enabled(gboolean enabled) {
+	dtls_recreate_on_ice_restart = enabled;
+	if(dtls_recreate_on_ice_restart) {
+		JANUS_LOG(LOG_INFO, "Will recreate DTLS stack on ICE restart\n");
+	}
+}
+gboolean janus_ice_is_dtls_recreate_on_ice_restart_enabled(void) {
+	return dtls_recreate_on_ice_restart;
+}
+
 /* Opaque IDs set by applications are by default only passed to event handlers
  * for correlation purposes, but not sent back to the user or application in
  * the related Janus API responses or events, unless configured otherwise */
@@ -3840,6 +3856,57 @@ int janus_ice_setup_local(janus_ice_handle *handle, gboolean offer, gboolean tri
 	return 0;
 }
 
+/* GDestroyNotify wrapper for janus_refcount_decrease, which is a macro and
+ * cannot be used directly as a function pointer. */
+static void janus_ice_dtls_recreate_unref(gpointer handle_ptr) {
+	janus_ice_handle *handle = (janus_ice_handle *)handle_ptr;
+	janus_refcount_decrease(&handle->ref);
+}
+
+/* Idle source callback: runs on the handle's GLib main loop, serialized with
+ * janus_ice_cb_nice_recv. Destroys the old DTLS stack and creates a fresh one
+ * so that a new ClientHello from the peer (e.g. after app restart) is accepted
+ * as a new handshake rather than rejected as RFC 5746 renegotiation.
+ * After this callback completes, wait for janus_ice_cb_nice_ready to trigger
+ * the new DTLS handshake once ICE reconnects. */
+static gboolean janus_ice_dtls_recreate_cb(gpointer user_data) {
+	janus_ice_handle *handle = (janus_ice_handle *)user_data;
+	if(!handle || janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_STOP))
+		return G_SOURCE_REMOVE;
+	/* Hold handle->mutex while touching pc->dtls, matching the pattern used by
+	 * janus_ice_webrtc_free() which sets handle->pc = NULL under the same lock. */
+	janus_mutex_lock(&handle->mutex);
+	janus_ice_peerconnection *pc = handle->pc;
+	if(!pc) {
+		janus_mutex_unlock(&handle->mutex);
+		return G_SOURCE_REMOVE;
+	}
+	JANUS_LOG(LOG_INFO, "[%"SCNu64"] Recreating DTLS stack after ICE restart\n", handle->handle_id);
+	if(pc->dtlsrt_source != NULL) {
+		g_source_destroy(pc->dtlsrt_source);
+		g_source_unref(pc->dtlsrt_source);
+		pc->dtlsrt_source = NULL;
+	}
+	if(pc->dtls != NULL) {
+		janus_dtls_srtp_destroy(pc->dtls);
+		janus_refcount_decrease(&pc->dtls->ref);
+		pc->dtls = NULL;
+	}
+	pc->dtls = janus_dtls_srtp_create(pc, pc->dtls_role);
+	if(!pc->dtls) {
+		JANUS_LOG(LOG_ERR, "[%"SCNu64"] Error recreating DTLS-SRTP stack on ICE restart...\n", handle->handle_id);
+		janus_mutex_unlock(&handle->mutex);
+		janus_ice_webrtc_hangup(handle, "DTLS-SRTP stack error on ICE restart");
+		return G_SOURCE_REMOVE;
+	}
+	janus_refcount_increase(&pc->dtls->ref);
+	/* Reset pc->connected so the DTLS handshake fires again when ICE reconnects.
+	 * Without this, the guard in janus_ice_cb_nice_ready skips the handshake path. */
+	pc->connected = 0;
+	janus_mutex_unlock(&handle->mutex);
+	return G_SOURCE_REMOVE;
+}
+
 void janus_ice_restart(janus_ice_handle *handle) {
 	if(!handle || !handle->agent || !handle->pc)
 		return;
@@ -3847,7 +3914,19 @@ void janus_ice_restart(janus_ice_handle *handle) {
 	if(nice_agent_restart(handle->agent) == FALSE) {
 		JANUS_LOG(LOG_WARN, "[%"SCNu64"] ICE restart failed...\n", handle->handle_id);
 	}
+	/* Clear the restart flag now: it signals "restart was requested", not "DTLS is ready". */
 	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
+	if(dtls_recreate_on_ice_restart) {
+		/* Schedule DTLS destroy/create on the handle's GLib main loop.
+		 * janus_ice_cb_nice_recv also runs on this loop, so the two operations
+		 * are serialized by the event loop dispatcher — no concurrent access to pc->dtls. */
+		janus_refcount_increase(&handle->ref);
+		GSource *idle_source = g_idle_source_new();
+		g_source_set_callback(idle_source, janus_ice_dtls_recreate_cb, handle,
+				janus_ice_dtls_recreate_unref);
+		g_source_attach(idle_source, handle->mainctx);
+		g_source_unref(idle_source);
+	}
 }
 
 void janus_ice_resend_trickles(janus_ice_handle *handle) {

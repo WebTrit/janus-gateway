@@ -5280,6 +5280,9 @@ gint main(int argc, char *argv[]) {
 	item = janus_config_get(config, config_nat, janus_config_type_item, "hangup_on_failed");
 	if(item && item->value)
 		janus_ice_set_hangup_on_failed_enabled(janus_is_true(item->value));
+	item = janus_config_get(config, config_nat, janus_config_type_item, "dtls_recreate_on_ice_restart");
+	if(item && item->value)
+		janus_ice_set_dtls_recreate_on_ice_restart_enabled(janus_is_true(item->value));
 	if(janus_ice_set_turn_server(turn_server, turn_port, turn_type, turn_user, turn_pwd) < 0) {
 		if(!ignore_unreachable_ice_server) {
 			JANUS_LOG(LOG_FATAL, "Invalid TURN address %s:%u\n", turn_server, turn_port);

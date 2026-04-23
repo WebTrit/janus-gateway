@@ -305,6 +305,10 @@ nat: {
 	# by uncommenting the following property and set it to true
 	#hangup_on_failed = true
 
+	# Recreate the DTLS stack on ICE restart so a fresh ClientHello from a
+	# reconnecting peer is treated as a new handshake rather than renegotiation.
+	#dtls_recreate_on_ice_restart = false
+
 	# By default Janus tries to resolve mDNS (.local) candidates: even
 	# though this is now done asynchronously and shouldn't keep the API
 	# busy, even in case mDNS resolution takes a long time to timeout,

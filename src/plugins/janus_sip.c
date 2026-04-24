@@ -1294,6 +1294,7 @@ typedef struct janus_sip_media {
 	char *video_srtp_local_profile, *video_srtp_local_crypto;
 	gboolean video_send, video_recv;
 	gboolean video_recv_pli_pending;
+	gboolean video_send_pli_pending;
 	gboolean video_pli_supported;
 	janus_sdp_mdirection hold_video_dir, pre_hold_video_dir;
 	janus_rtp_switching_context acontext, vcontext;
@@ -1818,6 +1819,7 @@ static void janus_sip_media_reset(janus_sip_session *session) {
 	session->media.video_send = TRUE;
 	session->media.video_recv = TRUE;
 	session->media.video_recv_pli_pending = FALSE;
+	session->media.video_send_pli_pending = FALSE;
 	session->media.video_pli_supported = FALSE;
 	session->media.hold_video_dir = JANUS_SDP_SENDONLY;
 	session->media.pre_hold_video_dir = JANUS_SDP_DEFAULT;
@@ -2917,6 +2919,14 @@ void janus_sip_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *pack
 				janus_rtp_header *header = (janus_rtp_header *)buf;
 				session->media.video_ssrc = ntohl(header->ssrc);
 				JANUS_LOG(LOG_VERB, "Got SIP video SSRC: %"SCNu32"\n", session->media.video_ssrc);
+			}
+			/* Deferred PLI: fire once the browser is confirmed sending after an
+			 * unhold renegotiation.  Sending the PLI in media.updated races against
+			 * the WebRTC renegotiation; deferring it here ensures the browser is in
+			 * sendonly/sendrecv state and will produce a keyframe in response. */
+			if(session->media.video_send_pli_pending) {
+				session->media.video_send_pli_pending = FALSE;
+				gateway->send_pli(session->handle);
 			}
 			if(session->media.has_video && session->media.video_rtp_fd != -1) {
 				/* Check if there are forwarders interested in this traffic */
@@ -8478,12 +8488,14 @@ static void *janus_sip_relay_thread(void *data) {
 
 			/* After reconnecting sockets, request keyframes to recover video.
 			 *
-			 * browser→SIP direction (video_send): ask the browser for a keyframe
-			 * unconditionally — no video_ssrc_peer guard because in one-directional
-			 * video (e.g. only A has a camera) the sender's video_ssrc_peer is 0 and
-			 * the guard would silently skip the PLI.  PortaSIP signals the sender's
-			 * leg ~100 ms before confirming unhold to the receiver, so the browser
-			 * has time to encode a fresh keyframe before the receiver's relay starts.
+			 * browser→SIP direction (video_send): defer the PLI until the first RTP
+			 * packet actually arrives from the browser (video_send_pli_pending).
+			 * Firing it immediately races against the WebRTC renegotiation that the
+			 * other side's browser must complete when it receives an updatingcall for
+			 * the unhold re-INVITE — the browser is still in inactive/recvonly state
+			 * when media.updated fires, so the PLI would be silently ignored.  The
+			 * deferred path in incoming_rtp fires the PLI only once the browser is
+			 * confirmed sending (i.e. renegotiation is complete).
 			 *
 			 * SIP→browser direction (video_recv): defer the PLI until the first RTP
 			 * packet is actually received from the SIP peer (video_recv_pli_pending).
@@ -8494,7 +8506,7 @@ static void *janus_sip_relay_thread(void *data) {
 			 * correct SSRC fields. */
 			if(have_video_server_ip && session->media.has_video) {
 				if(session->media.video_send)
-					gateway->send_pli(session->handle);
+					session->media.video_send_pli_pending = TRUE;
 				if(session->media.video_recv && session->media.video_ssrc_peer != 0)
 					session->media.video_recv_pli_pending = TRUE;
 			}

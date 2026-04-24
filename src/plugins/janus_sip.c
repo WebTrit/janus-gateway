@@ -8477,19 +8477,25 @@ static void *janus_sip_relay_thread(void *data) {
 			}
 
 			/* After reconnecting sockets, request keyframes to recover video.
-			 * For the browser→SIP direction (video_send), send PLI immediately since
-			 * the browser responds right away.  For the SIP→browser direction
-			 * (video_recv), defer the PLI until the first RTP packet is actually
-			 * received from the SIP peer: sending it here races against PortaSIP
-			 * resuming its media path (especially after hold/unhold where PortaSIP
-			 * itself may need to signal the far leg before it starts forwarding).
-			 * The deferred path in the video-RTP receive section clears the flag and
-			 * sends the PLI only once PortaSIP is confirmed sending. */
-			if(have_video_server_ip && session->media.has_video &&
-					session->media.video_ssrc_peer != 0) {
+			 *
+			 * browser→SIP direction (video_send): ask the browser for a keyframe
+			 * unconditionally — no video_ssrc_peer guard because in one-directional
+			 * video (e.g. only A has a camera) the sender's video_ssrc_peer is 0 and
+			 * the guard would silently skip the PLI.  PortaSIP signals the sender's
+			 * leg ~100 ms before confirming unhold to the receiver, so the browser
+			 * has time to encode a fresh keyframe before the receiver's relay starts.
+			 *
+			 * SIP→browser direction (video_recv): defer the PLI until the first RTP
+			 * packet is actually received from the SIP peer (video_recv_pli_pending).
+			 * Sending it immediately races against PortaSIP resuming its forwarding
+			 * path.  The deferred path in the video-RTP receive section clears the
+			 * flag and sends to PortaSIP only once PortaSIP is confirmed sending.
+			 * video_ssrc_peer != 0 is still required here because the RTCP PLI needs
+			 * correct SSRC fields. */
+			if(have_video_server_ip && session->media.has_video) {
 				if(session->media.video_send)
 					gateway->send_pli(session->handle);
-				if(session->media.video_recv)
+				if(session->media.video_recv && session->media.video_ssrc_peer != 0)
 					session->media.video_recv_pli_pending = TRUE;
 			}
 		}

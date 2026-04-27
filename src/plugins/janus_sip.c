@@ -4665,7 +4665,7 @@ static void *janus_sip_handler(void *data) {
 			}
 			const char *msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
 			gboolean offer = !strcasecmp(msg_sdp_type, "offer");
-			if(!offer && session->status == janus_sip_call_status_incall) {
+			if(!offer && session->status == janus_sip_call_status_incall && !session->media.unhold_video_recovery) {
 				JANUS_LOG(LOG_ERR, "[SIP-%s] SDP type %s is incompatible with session status %s\n", session->account.username, msg_sdp_type, janus_sip_call_status_string(session->status));
 				error_code = JANUS_SIP_ERROR_MISSING_SDP;
 				g_snprintf(error_cause, 512, "[SIP-%s] SDP type %s is incompatible with session status %s\n", session->account.username, msg_sdp_type, janus_sip_call_status_string(session->status));

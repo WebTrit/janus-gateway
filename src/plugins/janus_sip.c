@@ -1259,6 +1259,9 @@ typedef struct janus_sip_media {
 	 *           requires no SIP action (video already flowing from relay thread via 200 OK)
 	 *   Case B: 200 OK still has video=0 (PortaSwitch pattern) → incoming re-INVITE with video must
 	 *           bypass auto-accept so the browser can renegotiate and answer with a proper SDP */
+	gboolean unhold_video_recovery;	/* TRUE when a synthetic updatingcall was fired after an unhold 200 OK
+	 * so the browser can renegotiate and unfreeze its video element; the browser answer requires
+	 * no SIP action (PortaSIP already confirmed the unhold in the 200 OK) */
 	gboolean update;
 	gboolean autoaccept_reinvites;
 	gboolean ready;
@@ -1799,6 +1802,7 @@ static void janus_sip_media_reset(janus_sip_session *session) {
 	session->media.remote_video_ip = NULL;
 	session->media.earlymedia = FALSE;
 	session->media.earlymedia_video_recovery = FALSE;
+	session->media.unhold_video_recovery = FALSE;
 	session->media.update = FALSE;
 	session->media.updated = FALSE;
 	session->media.autoaccept_reinvites = TRUE;
@@ -2598,6 +2602,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->media.remote_video_ip = NULL;
 	session->media.earlymedia = FALSE;
 	session->media.earlymedia_video_recovery = FALSE;
+	session->media.unhold_video_recovery = FALSE;
 	session->media.update = FALSE;
 	session->media.autoaccept_reinvites = TRUE;
 	session->media.ready = FALSE;
@@ -4765,6 +4770,13 @@ static void *janus_sip_handler(void *data) {
 				session->media.earlymedia_video_recovery = FALSE;
 				session->media.update = FALSE;
 				janus_sip_call_update_status(session, janus_sip_call_status_incall);
+			} else if(session->media.unhold_video_recovery && !offer) {
+				/* Browser answered the synthetic updatingcall fired after an unhold 200 OK.
+				 * PortaSIP already confirmed the unhold — no SIP re-INVITE needed. */
+				JANUS_LOG(LOG_VERB, "unhold video recovery: browser answered updatingcall — no SIP re-INVITE needed\n");
+				session->media.unhold_video_recovery = FALSE;
+				session->media.update = FALSE;
+				janus_sip_call_update_status(session, janus_sip_call_status_incall);
 			} else if(session->status == janus_sip_call_status_incall) {
 				/* Retrieve the Contact header for manually adding if not NULL */
 				char *contact_header = janus_sip_session_contact_header_retrieve(session);
@@ -5110,6 +5122,7 @@ static void *janus_sip_handler(void *data) {
 			janus_mutex_unlock(&session->mutex);
 			session->media.earlymedia = FALSE;
 			session->media.earlymedia_video_recovery = FALSE;
+			session->media.unhold_video_recovery = FALSE;
 			session->media.update = FALSE;
 			session->media.autoaccept_reinvites = TRUE;
 			session->media.ready = FALSE;
@@ -7133,6 +7146,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				/* Hangup immediately */
 				session->media.earlymedia = FALSE;
 				session->media.earlymedia_video_recovery = FALSE;
+				session->media.unhold_video_recovery = FALSE;
 				session->media.update = FALSE;
 				session->media.autoaccept_reinvites = TRUE;
 				session->media.ready = FALSE;
@@ -7152,6 +7166,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				/* Hangup immediately */
 				session->media.earlymedia = FALSE;
 				session->media.earlymedia_video_recovery = FALSE;
+				session->media.unhold_video_recovery = FALSE;
 				session->media.update = FALSE;
 				session->media.autoaccept_reinvites = TRUE;
 				session->media.ready = FALSE;
@@ -7174,8 +7189,28 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			}
 			session->media.ready = TRUE;	/* FIXME Maybe we need a better way to signal this */
 			if(update && !session->media.earlymedia && !session->media.update) {
-				/* Don't push to the application if this is in response to a hold/unhold we sent ourselves */
-				JANUS_LOG(LOG_VERB, "This is an update to an existing call (possibly in response to hold/unhold)\n");
+				/* 200 OK to a re-INVITE we sent (e.g. hold/unhold).
+				 * For unhold with video, fire a synthetic updatingcall so the browser
+				 * renegotiates and unfreezes its video element. */
+				if(!session->media.on_hold && session->media.has_video) {
+					JANUS_LOG(LOG_VERB, "Unhold 200 OK with video — firing synthetic updatingcall to unfreeze browser video\n");
+					session->media.unhold_video_recovery = TRUE;
+					janus_sip_call_update_status(session, janus_sip_call_status_incall_reinvited);
+					json_t *unhold_call = json_object();
+					json_object_set_new(unhold_call, "sip", json_string("event"));
+					json_t *unhold_result = json_object();
+					json_object_set_new(unhold_result, "event", json_string("updatingcall"));
+					json_object_set_new(unhold_result, "username", json_string(session->callee));
+					json_object_set_new(unhold_call, "result", unhold_result);
+					json_object_set_new(unhold_call, "call_id", json_string(session->callid));
+					json_t *unhold_jsep = json_pack("{ssss}", "type", "offer", "sdp", fixed_sdp);
+					int upd_ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, unhold_call, unhold_jsep);
+					JANUS_LOG(LOG_VERB, "  >> Pushing synthetic updatingcall (unhold): %d (%s)\n", upd_ret, janus_get_api_error(upd_ret));
+					json_decref(unhold_call);
+					json_decref(unhold_jsep);
+				} else {
+					JANUS_LOG(LOG_VERB, "This is an update to an existing call (possibly in response to hold/unhold)\n");
+				}
 				janus_sdp_destroy(sdp);
 				break;
 			}

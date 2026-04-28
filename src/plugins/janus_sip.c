@@ -7201,6 +7201,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					json_t *unhold_result = json_object();
 					json_object_set_new(unhold_result, "event", json_string("updatingcall"));
 					json_object_set_new(unhold_result, "username", json_string(session->callee));
+					if(session->account.identity)
+						json_object_set_new(unhold_result, "callee", json_string(session->account.identity));
+					if(session->callid)
+						json_object_set_new(unhold_result, "call_id", json_string(session->callid));
 					json_object_set_new(unhold_call, "result", unhold_result);
 					json_object_set_new(unhold_call, "call_id", json_string(session->callid));
 					json_t *unhold_jsep = json_pack("{ssss}", "type", "offer", "sdp", fixed_sdp);
@@ -7309,6 +7313,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				json_t *update_result = json_object();
 				json_object_set_new(update_result, "event", json_string("updatingcall"));
 				json_object_set_new(update_result, "username", json_string(session->callee));
+				if(session->account.identity)
+					json_object_set_new(update_result, "callee", json_string(session->account.identity));
+				if(session->callid)
+					json_object_set_new(update_result, "call_id", json_string(session->callid));
 				json_object_set_new(update_call, "result", update_result);
 				json_object_set_new(update_call, "call_id", json_string(session->callid));
 				json_t *update_jsep = json_pack("{ssss}", "type", "offer", "sdp", fixed_sdp);

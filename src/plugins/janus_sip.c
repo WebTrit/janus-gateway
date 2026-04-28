@@ -4777,6 +4777,13 @@ static void *janus_sip_handler(void *data) {
 				session->media.unhold_video_recovery = FALSE;
 				session->media.update = FALSE;
 				janus_sip_call_update_status(session, janus_sip_call_status_incall);
+				/* The relay thread already sent one PLI when the unhold 200 OK arrived, but
+				 * that keyframe was dropped because the browser was still mid-renegotiation.
+				 * Now that renegotiation is complete, request a fresh keyframe so the
+				 * browser decoder can recover immediately. */
+				if(session->media.has_video && session->media.video_recv &&
+						session->media.video_ssrc_peer != 0)
+					session->media.video_recv_pli_pending = TRUE;
 			} else if(session->status == janus_sip_call_status_incall) {
 				/* Retrieve the Contact header for manually adding if not NULL */
 				char *contact_header = janus_sip_session_contact_header_retrieve(session);

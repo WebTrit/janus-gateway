@@ -4777,13 +4777,10 @@ static void *janus_sip_handler(void *data) {
 				session->media.unhold_video_recovery = FALSE;
 				session->media.update = FALSE;
 				janus_sip_call_update_status(session, janus_sip_call_status_incall);
-				/* The relay thread already sent one PLI when the unhold 200 OK arrived, but
-				 * that keyframe was dropped because the browser was still mid-renegotiation.
-				 * Now that renegotiation is complete, request a fresh keyframe so the
-				 * browser decoder can recover immediately. */
-				if(session->media.has_video && session->media.video_recv &&
-						session->media.video_ssrc_peer != 0)
-					session->media.video_recv_pli_pending = TRUE;
+				/* Renegotiation is complete — send PLI directly so PortaSIP sends a fresh
+				 * keyframe that the browser decoder can now accept without dropping. */
+				if(session->media.has_video && session->media.video_recv)
+					janus_sip_rtcp_pli_send(session);
 			} else if(session->status == janus_sip_call_status_incall) {
 				/* Retrieve the Contact header for manually adding if not NULL */
 				char *contact_header = janus_sip_session_contact_header_retrieve(session);
@@ -8547,18 +8544,21 @@ static void *janus_sip_relay_thread(void *data) {
 			 * deferred path in incoming_rtp fires the PLI only once the browser is
 			 * confirmed sending (i.e. renegotiation is complete).
 			 *
-			 * SIP→browser direction (video_recv): defer the PLI until the first RTP
-			 * packet is actually received from the SIP peer (video_recv_pli_pending).
-			 * Sending it immediately races against PortaSIP resuming its forwarding
-			 * path.  The deferred path in the video-RTP receive section clears the
-			 * flag and sends to PortaSIP only once PortaSIP is confirmed sending.
-			 * video_ssrc_peer != 0 is still required here because the RTCP PLI needs
-			 * correct SSRC fields. */
+			 * SIP→browser direction (video_recv): send a PLI immediately after
+			 * reconnecting the RTCP socket.  Some SIP peers (e.g. PortaSIP) wait
+			 * for an explicit PLI before resuming the video stream after hold, so
+			 * deferring until the first incoming packet creates a deadlock.  Also
+			 * set video_recv_pli_pending so that if the immediate PLI's keyframe
+			 * arrives while the browser is still mid-renegotiation (and is therefore
+			 * dropped), another PLI fires on the next incoming packet. */
 			if(have_video_server_ip && session->media.has_video) {
 				if(session->media.video_send)
 					session->media.video_send_pli_pending = TRUE;
-				if(session->media.video_recv && session->media.video_ssrc_peer != 0)
+				if(session->media.video_recv) {
+					if(session->media.video_ssrc_peer != 0)
+						janus_sip_rtcp_pli_send(session);
 					session->media.video_recv_pli_pending = TRUE;
+				}
 			}
 		}
 

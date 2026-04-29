@@ -7200,6 +7200,16 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					JANUS_LOG(LOG_VERB, "Unhold 200 OK with video — firing synthetic updatingcall to unfreeze browser video\n");
 					session->media.unhold_video_recovery = TRUE;
 					janus_sip_call_update_status(session, janus_sip_call_status_incall_reinvited);
+					/* Use sendrecv for video in the synthetic offer: when PortaSIP answers
+					 * with a=sendonly (it only sends, B has no camera), the browser fails to
+					 * resume rendering the frozen track after renegotiation. Forcing sendrecv
+					 * mimics a normal re-INVITE and causes the browser to correctly unfreeze.
+					 * B's answer will still be a=recvonly since restoreTransceiverDirections()
+					 * in the Dialer preserves recvonly when there is no local video sender. */
+					janus_sdp_mline *unhold_video_ml = janus_sdp_mline_find(sdp, JANUS_SDP_VIDEO);
+					if(unhold_video_ml && unhold_video_ml->direction == JANUS_SDP_SENDONLY)
+						unhold_video_ml->direction = JANUS_SDP_SENDRECV;
+					char *unhold_offer_sdp = janus_sdp_write(sdp);
 					json_t *unhold_call = json_object();
 					json_object_set_new(unhold_call, "sip", json_string("event"));
 					json_t *unhold_result = json_object();
@@ -7211,11 +7221,12 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 						json_object_set_new(unhold_result, "call_id", json_string(session->callid));
 					json_object_set_new(unhold_call, "result", unhold_result);
 					json_object_set_new(unhold_call, "call_id", json_string(session->callid));
-					json_t *unhold_jsep = json_pack("{ssss}", "type", "offer", "sdp", fixed_sdp);
+					json_t *unhold_jsep = json_pack("{ssss}", "type", "offer", "sdp", unhold_offer_sdp);
 					int upd_ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, unhold_call, unhold_jsep);
 					JANUS_LOG(LOG_VERB, "  >> Pushing synthetic updatingcall (unhold): %d (%s)\n", upd_ret, janus_get_api_error(upd_ret));
 					json_decref(unhold_call);
 					json_decref(unhold_jsep);
+					g_free(unhold_offer_sdp);
 				} else {
 					JANUS_LOG(LOG_VERB, "This is an update to an existing call (possibly in response to hold/unhold)\n");
 				}

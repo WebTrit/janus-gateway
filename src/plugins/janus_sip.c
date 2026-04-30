@@ -7825,6 +7825,12 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 				} else if(m->type == JANUS_SDP_VIDEO && !strcasecmp(a->name, "rtcp-fb") && a->value) {
 					if(strstr(a->value, " pli"))
 						session->media.video_pli_supported = TRUE;
+				} else if(!strcasecmp(a->name, "rtcp-mux")) {
+					/* RTCP is multiplexed on the RTP port; correct the RTCP port set above */
+					if(m->type == JANUS_SDP_AUDIO)
+						session->media.remote_audio_rtcp_port = session->media.remote_audio_rtp_port;
+					else if(m->type == JANUS_SDP_VIDEO)
+						session->media.remote_video_rtcp_port = session->media.remote_video_rtp_port;
 				}
 			}
 			tempA = tempA->next;

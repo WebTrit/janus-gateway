@@ -5091,7 +5091,19 @@ static void *janus_sip_handler(void *data) {
 							}
 						}
 					} else {
-						m->direction = session->media.pre_hold_video_dir;
+						/* PortaSIP RTPproxy bug workaround: when the pre-hold video
+						 * direction was recvonly (e.g. the far end has no camera), Janus
+						 * would offer recvonly in the unhold re-INVITE.  PortaSIP relays
+						 * that recvonly to the other leg, which correctly answers sendonly
+						 * per RFC 3264.  PortaSIP then interprets the sendonly answer as a
+						 * hold-like signal and sets its RTPproxy to no-relay (Nn) mode,
+						 * permanently blocking video from the sender to this leg.
+						 * Offering sendrecv instead prevents PortaSIP from entering the
+						 * broken no-relay state while still resulting in a one-directional
+						 * video flow in practice (the sender answers sendrecv, the receiver
+						 * has no camera so sends nothing). */
+						m->direction = (session->media.pre_hold_video_dir == JANUS_SDP_RECVONLY)
+							? JANUS_SDP_SENDRECV : session->media.pre_hold_video_dir;
 					}
 				}
 				/* Check if the INVITE needs to be enriched with custom headers */

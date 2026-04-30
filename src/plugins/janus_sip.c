@@ -7692,6 +7692,13 @@ void janus_sip_save_reason(sip_t const *sip, janus_sip_session *session) {
 void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean answer, gboolean update, gboolean *changed) {
 	if(!session || !sdp)
 		return;
+	if(update) {
+		/* Log the raw SDP so we can see the actual remote directions and attributes */
+		char *raw_sdp = janus_sdp_write(sdp);
+		JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] sdp_process(update=TRUE answer=%d):\n%s\n",
+			session->account.username, answer, raw_sdp ? raw_sdp : "(null)");
+		g_free(raw_sdp);
+	}
 	/* c= */
 	int opusred_pt = answer ? janus_sdp_get_opusred_pt(sdp, -1) : -1;
 	if(sdp->c_addr) {

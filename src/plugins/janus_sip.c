@@ -4735,8 +4735,19 @@ static void *janus_sip_handler(void *data) {
 					goto error;
 				}
 				janus_mutex_unlock(&session->mutex);
-				if(!offer)
+				if(!offer) {
+					/* Wake the relay thread immediately so it connects the newly
+					 * allocated video/audio sockets without waiting for the 1-second
+					 * poll timeout. */
 					session->media.updated = TRUE;
+					if(session->media.pipefd[1] > 0) {
+						int code = 1;
+						ssize_t res = 0;
+						do {
+							res = write(session->media.pipefd[1], &code, sizeof(int));
+						} while(res == -1 && errno == EINTR);
+					}
+				}
 			}
 			char *sdp = janus_sip_sdp_manipulate(session, parsed_sdp, !offer);
 			if(sdp == NULL) {

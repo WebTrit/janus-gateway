@@ -4779,14 +4779,35 @@ static void *janus_sip_handler(void *data) {
 				session->media.unhold_video_recovery = FALSE;
 				session->media.update = FALSE;
 				janus_sip_call_update_status(session, janus_sip_call_status_incall);
-				/* Renegotiation is complete — send PLI directly so PortaSIP sends a fresh
-				 * keyframe that the browser decoder can now accept without dropping. */
+				/* Renegotiation is complete.  Request keyframes in both directions so
+				 * neither side stays frozen.
+				 *
+				 * PortaSIP→browser (video_recv): send PLI to PortaSIP so it emits a
+				 * fresh keyframe that the browser decoder can now accept without
+				 * dropping (earlier keyframes from PLI #1/#2 arrived while the browser
+				 * was still mid-renegotiation).  Also re-arm video_recv_pli_pending so
+				 * the very next incoming packet triggers a follow-up PLI — a safety
+				 * net if the keyframe from this PLI also arrives too early.
+				 *
+				 * browser→PortaSIP (video_send): request a keyframe from the browser.
+				 * video_send_pli_pending (set in media.updated) may already have been
+				 * consumed by continuous video during a sendonly hold; explicitly sending
+				 * send_pli here ensures PortaSIP gets a fresh keyframe after
+				 * renegotiation regardless of the hold direction. */
 				JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] unhold_video_recovery: browser answered; "
-					"has_video=%d video_recv=%d\n",
+					"has_video=%d video_recv=%d video_send=%d\n",
 					session->account.username,
-					session->media.has_video, session->media.video_recv);
-				if(session->media.has_video && session->media.video_recv)
+					session->media.has_video, session->media.video_recv, session->media.video_send);
+				if(session->media.has_video && session->media.video_recv) {
 					janus_sip_rtcp_pli_send(session);
+					session->media.video_recv_pli_pending = TRUE;
+				}
+				if(session->media.has_video && session->media.video_send) {
+					JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] unhold_video_recovery: requesting keyframe from browser\n",
+						session->account.username);
+					gateway->send_pli(session->handle);
+					session->media.video_send_pli_pending = FALSE;
+				}
 			} else if(session->status == janus_sip_call_status_incall) {
 				/* Retrieve the Contact header for manually adding if not NULL */
 				char *contact_header = janus_sip_session_contact_header_retrieve(session);

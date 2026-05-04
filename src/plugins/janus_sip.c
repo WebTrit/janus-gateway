@@ -1262,6 +1262,8 @@ typedef struct janus_sip_media {
 	gboolean unhold_video_recovery;	/* TRUE when a synthetic updatingcall was fired after an unhold 200 OK
 	 * so the browser can renegotiate and unfreeze its video element; the browser answer requires
 	 * no SIP action (PortaSIP already confirmed the unhold in the 200 OK) */
+	char *pending_reinvite_sdp;		/* SDP buffered during re-INVITE glare: app sent update(offer) while we
+	 * were incall_reinvited.  Sent as our own re-INVITE after we answer the incoming one. */
 	gboolean update;
 	gboolean autoaccept_reinvites;
 	gboolean ready;
@@ -1803,6 +1805,8 @@ static void janus_sip_media_reset(janus_sip_session *session) {
 	session->media.earlymedia = FALSE;
 	session->media.earlymedia_video_recovery = FALSE;
 	session->media.unhold_video_recovery = FALSE;
+	g_free(session->media.pending_reinvite_sdp);
+	session->media.pending_reinvite_sdp = NULL;
 	session->media.update = FALSE;
 	session->media.updated = FALSE;
 	session->media.autoaccept_reinvites = TRUE;
@@ -4689,8 +4693,12 @@ static void *janus_sip_handler(void *data) {
 			}
 
 			if(session->status == janus_sip_call_status_incall_reinvited && offer) {
-				/* We have re-INVITE in progress */
-				JANUS_LOG(LOG_VERB, "[SIP-%s] We have incoming offereless re-INVITE in progress\n", session->account.username);
+				/* Glare: the application sent update(offer) while an incoming re-INVITE
+				 * is still pending.  Log for diagnostics only; the offer will be buffered
+				 * below and sent after we answer the incoming re-INVITE. */
+				JANUS_LOG(LOG_WARN, "[SIP-%s] Glare on re-INVITE (incall_reinvited + offer): "
+					"buffering outgoing offer, will send after answering incoming re-INVITE\n",
+					session->account.username);
 			}
 
 			if(offer)
@@ -4819,6 +4827,18 @@ static void *janus_sip_handler(void *data) {
 					gateway->send_pli(session->handle);
 					session->media.video_send_pli_pending = FALSE;
 				}
+			} else if(session->status == janus_sip_call_status_incall_reinvited && offer) {
+				/* Glare: app sent update(offer) while an incoming re-INVITE is still in
+				 * progress (incall_reinvited).  Sending this offer as a 200 OK answer
+				 * would be an SDP type mismatch.  Buffer the SDP and send it as our own
+				 * re-INVITE from nua_callstate_ready once we have answered the incoming
+				 * one.  The relay thread receives media.updated below to connect the newly
+				 * allocated video socket to the peer address announced in the re-INVITE. */
+				g_free(session->media.pending_reinvite_sdp);
+				session->media.pending_reinvite_sdp = sdp;
+				sdp = NULL;		/* ownership transferred — g_free(sdp) below is a no-op */
+				if(video_added)
+					session->media.updated = TRUE;	/* connect new video socket to peer address */
 			} else if(session->status == janus_sip_call_status_incall) {
 				/* Retrieve the Contact header for manually adding if not NULL */
 				char *contact_header = janus_sip_session_contact_header_retrieve(session);
@@ -6247,6 +6267,27 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					(session->status == janus_sip_call_status_incall_reinviting || session->status == janus_sip_call_status_incall_reinvited)) {
 				/* Clear re-INVITE progress status */
 				janus_sip_call_update_status(session, janus_sip_call_status_incall);
+				/* If the app sent update(offer) while we were incall_reinvited (glare), the
+				 * SDP was buffered.  Now that the incoming re-INVITE has completed (ACK
+				 * received), send our own re-INVITE with the buffered offer. */
+				if(session->media.pending_reinvite_sdp) {
+					char *pending_sdp = session->media.pending_reinvite_sdp;
+					session->media.pending_reinvite_sdp = NULL;
+					/* Mark that we're sending an offer re-INVITE so that nua_r_invite knows
+					 * the 200 OK is an answer (not a hold/unhold response).  Without this,
+					 * nua_r_invite sees media.update=FALSE and fires the unhold_video_recovery
+					 * path, causing an unnecessary synthetic updatingcall and video freeze. */
+					session->media.update = TRUE;
+					char *contact_header = janus_sip_session_contact_header_retrieve(session);
+					JANUS_LOG(LOG_VERB, "[SIP-%s] Sending buffered glare re-INVITE now that incoming one completed\n",
+						session->account.username);
+					janus_sip_call_update_status(session, janus_sip_call_status_incall_reinviting);
+					nua_invite(session->stack->s_nh_i,
+						TAG_IF(contact_header != NULL, SIPTAG_CONTACT_STR(contact_header)),
+						SOATAG_USER_SDP_STR(pending_sdp),
+						TAG_END());
+					g_free(pending_sdp);
+				}
 			}
 			break;
 		case nua_i_terminated: {

@@ -77,10 +77,20 @@ AC_SUBST(JANUS_VERSION_SO)
 
 case "$host_os" in
 darwin*)
-	CFLAGS="$CFLAGS -I/usr/local/opt/openssl/include -I/usr/local/include"
+      CFLAGS="$CFLAGS -I/usr/local/include"
+      if test -d "/opt/homebrew/opt/openssl@3/include"; then
+            CFLAGS="$CFLAGS -I/opt/homebrew/opt/openssl@3/include"
+            LDFLAGS="$LDFLAGS -L/opt/homebrew/opt/openssl@3/lib"
+      elif test -d "/usr/local/opt/openssl@3/include"; then
+            CFLAGS="$CFLAGS -I/usr/local/opt/openssl@3/include"
+            LDFLAGS="$LDFLAGS -L/usr/local/opt/openssl@3/lib"
+      elif test -d "/usr/local/opt/openssl/include"; then
+            CFLAGS="$CFLAGS -I/usr/local/opt/openssl/include"
+            LDFLAGS="$LDFLAGS -L/usr/local/opt/openssl/lib"
+      fi
 	# add rdynamic to LDFLAGS
 	LDFLAGS="$LDFLAGS -Wl,-export_dynamic"
-	LDFLAGS="$LDFLAGS -L/usr/local/lib -L/usr/local/opt/openssl/lib -L/opt/local/lib -L/usr/local/libsrtp/lib"
+      LDFLAGS="$LDFLAGS -L/usr/local/lib -L/opt/local/lib -L/usr/local/libsrtp/lib"
 	AM_CONDITIONAL([DARWIN_OS], true)
 ;;
 freebsd*)

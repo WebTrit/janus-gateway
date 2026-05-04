@@ -2935,6 +2935,8 @@ void janus_sip_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *pack
 			 * sendonly/sendrecv state and will produce a keyframe in response. */
 			if(session->media.video_send_pli_pending) {
 				session->media.video_send_pli_pending = FALSE;
+				JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] deferred video_send_pli_pending: first RTP from browser arrived, sending PLI to browser\n",
+					session->account.username);
 				gateway->send_pli(session->handle);
 			}
 			if(session->media.has_video && session->media.video_rtp_fd != -1) {
@@ -4741,8 +4743,19 @@ static void *janus_sip_handler(void *data) {
 					goto error;
 				}
 				janus_mutex_unlock(&session->mutex);
-				if(!offer)
+				if(!offer) {
+					/* Wake the relay thread immediately so it connects the newly
+					 * allocated video/audio sockets without waiting for the 1-second
+					 * poll timeout. */
 					session->media.updated = TRUE;
+					if(session->media.pipefd[1] > 0) {
+						int code = 1;
+						ssize_t res = 0;
+						do {
+							res = write(session->media.pipefd[1], &code, sizeof(int));
+						} while(res == -1 && errno == EINTR);
+					}
+				}
 			}
 			char *sdp = janus_sip_sdp_manipulate(session, parsed_sdp, !offer);
 			if(sdp == NULL) {
@@ -4785,10 +4798,35 @@ static void *janus_sip_handler(void *data) {
 				session->media.unhold_video_recovery = FALSE;
 				session->media.update = FALSE;
 				janus_sip_call_update_status(session, janus_sip_call_status_incall);
-				/* Renegotiation is complete — send PLI directly so PortaSIP sends a fresh
-				 * keyframe that the browser decoder can now accept without dropping. */
-				if(session->media.has_video && session->media.video_recv)
+				/* Renegotiation is complete.  Request keyframes in both directions so
+				 * neither side stays frozen.
+				 *
+				 * PortaSIP→browser (video_recv): send PLI to PortaSIP so it emits a
+				 * fresh keyframe that the browser decoder can now accept without
+				 * dropping (earlier keyframes from PLI #1/#2 arrived while the browser
+				 * was still mid-renegotiation).  Also re-arm video_recv_pli_pending so
+				 * the very next incoming packet triggers a follow-up PLI — a safety
+				 * net if the keyframe from this PLI also arrives too early.
+				 *
+				 * browser→PortaSIP (video_send): request a keyframe from the browser.
+				 * video_send_pli_pending (set in media.updated) may already have been
+				 * consumed by continuous video during a sendonly hold; explicitly sending
+				 * send_pli here ensures PortaSIP gets a fresh keyframe after
+				 * renegotiation regardless of the hold direction. */
+				JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] unhold_video_recovery: browser answered; "
+					"has_video=%d video_recv=%d video_send=%d\n",
+					session->account.username,
+					session->media.has_video, session->media.video_recv, session->media.video_send);
+				if(session->media.has_video && session->media.video_recv) {
 					janus_sip_rtcp_pli_send(session);
+					session->media.video_recv_pli_pending = TRUE;
+				}
+				if(session->media.has_video && session->media.video_send) {
+					JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] unhold_video_recovery: requesting keyframe from browser\n",
+						session->account.username);
+					gateway->send_pli(session->handle);
+					session->media.video_send_pli_pending = FALSE;
+				}
 			} else if(session->status == janus_sip_call_status_incall_reinvited && offer) {
 				/* Glare: app sent update(offer) while an incoming re-INVITE is still in
 				 * progress (incall_reinvited).  Sending this offer as a 200 OK answer
@@ -5105,7 +5143,19 @@ static void *janus_sip_handler(void *data) {
 							}
 						}
 					} else {
-						m->direction = session->media.pre_hold_video_dir;
+						/* PortaSIP RTPproxy bug workaround: when the pre-hold video
+						 * direction was recvonly (e.g. the far end has no camera), Janus
+						 * would offer recvonly in the unhold re-INVITE.  PortaSIP relays
+						 * that recvonly to the other leg, which correctly answers sendonly
+						 * per RFC 3264.  PortaSIP then interprets the sendonly answer as a
+						 * hold-like signal and sets its RTPproxy to no-relay (Nn) mode,
+						 * permanently blocking video from the sender to this leg.
+						 * Offering sendrecv instead prevents PortaSIP from entering the
+						 * broken no-relay state while still resulting in a one-directional
+						 * video flow in practice (the sender answers sendrecv, the receiver
+						 * has no camera so sends nothing). */
+						m->direction = (session->media.pre_hold_video_dir == JANUS_SDP_RECVONLY)
+							? JANUS_SDP_SENDRECV : session->media.pre_hold_video_dir;
 					}
 				}
 				/* Check if the INVITE needs to be enriched with custom headers */
@@ -7238,7 +7288,11 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				 * For unhold with video, fire a synthetic updatingcall so the browser
 				 * renegotiates and unfreezes its video element. */
 				if(!session->media.on_hold && session->media.has_video) {
-					JANUS_LOG(LOG_VERB, "Unhold 200 OK with video — firing synthetic updatingcall to unfreeze browser video\n");
+					JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] Unhold 200 OK with video — firing synthetic updatingcall; "
+						"video_recv=%d video_send=%d rtcp_port=%d\n",
+						session->account.username,
+						session->media.video_recv, session->media.video_send,
+						session->media.remote_video_rtcp_port);
 					session->media.unhold_video_recovery = TRUE;
 					janus_sip_call_update_status(session, janus_sip_call_status_incall_reinvited);
 					/* Use sendrecv for video in the synthetic offer: when PortaSIP answers
@@ -7723,6 +7777,13 @@ void janus_sip_save_reason(sip_t const *sip, janus_sip_session *session) {
 void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean answer, gboolean update, gboolean *changed) {
 	if(!session || !sdp)
 		return;
+	if(update) {
+		/* Log the raw SDP so we can see the actual remote directions and attributes */
+		char *raw_sdp = janus_sdp_write(sdp);
+		JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] sdp_process(update=TRUE answer=%d):\n%s\n",
+			session->account.username, answer, raw_sdp ? raw_sdp : "(null)");
+		g_free(raw_sdp);
+	}
 	/* c= */
 	int opusred_pt = answer ? janus_sdp_get_opusred_pt(sdp, -1) : -1;
 	if(sdp->c_addr) {
@@ -7866,6 +7927,12 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 				} else if(m->type == JANUS_SDP_VIDEO && !strcasecmp(a->name, "rtcp-fb") && a->value) {
 					if(strstr(a->value, " pli"))
 						session->media.video_pli_supported = TRUE;
+				} else if(!strcasecmp(a->name, "rtcp-mux")) {
+					/* RTCP is multiplexed on the RTP port; correct the RTCP port set above */
+					if(m->type == JANUS_SDP_AUDIO)
+						session->media.remote_audio_rtcp_port = session->media.remote_audio_rtp_port;
+					else if(m->type == JANUS_SDP_VIDEO)
+						session->media.remote_video_rtcp_port = session->media.remote_video_rtp_port;
 				}
 			}
 			tempA = tempA->next;
@@ -7894,6 +7961,12 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 
 	if(update && changed && *changed) {
 		/* Something changed: mark this on the session, so that the thread can update the sockets */
+		JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] sdp_process: changed=TRUE -> media.updated=TRUE; "
+			"video: recv=%d send=%d rtp_port=%d rtcp_port=%d ssrc_peer=%"SCNu32"\n",
+			session->account.username,
+			session->media.video_recv, session->media.video_send,
+			session->media.remote_video_rtp_port, session->media.remote_video_rtcp_port,
+			session->media.video_ssrc_peer);
 		session->media.updated = TRUE;
 		if(session->media.pipefd[1] > 0) {
 			int code = 1;
@@ -8604,11 +8677,23 @@ static void *janus_sip_relay_thread(void *data) {
 			 * arrives while the browser is still mid-renegotiation (and is therefore
 			 * dropped), another PLI fires on the next incoming packet. */
 			if(have_video_server_ip && session->media.has_video) {
+				JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] media.updated: video recv=%d send=%d "
+					"ssrc_peer=%"SCNu32" rtcp_port=%d rtcp_fd=%d\n",
+					session->account.username,
+					session->media.video_recv, session->media.video_send,
+					session->media.video_ssrc_peer,
+					session->media.remote_video_rtcp_port, session->media.video_rtcp_fd);
 				if(session->media.video_send)
 					session->media.video_send_pli_pending = TRUE;
 				if(session->media.video_recv) {
-					if(session->media.video_ssrc_peer != 0)
+					if(session->media.video_ssrc_peer != 0) {
+						JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] media.updated: firing immediate PLI to peer (ssrc=%"SCNu32")\n",
+							session->account.username, session->media.video_ssrc_peer);
 						janus_sip_rtcp_pli_send(session);
+					} else {
+						JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] media.updated: skipping immediate PLI (ssrc_peer=0)\n",
+							session->account.username);
+					}
 					session->media.video_recv_pli_pending = TRUE;
 				}
 			}
@@ -8833,6 +8918,8 @@ static void *janus_sip_relay_thread(void *data) {
 					 * is actually forwarding (set in media.updated on unhold/reconnect). */
 					if(session->media.video_recv_pli_pending) {
 						session->media.video_recv_pli_pending = FALSE;
+						JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] deferred video_recv_pli_pending: first packet arrived, firing PLI\n",
+							session->account.username);
 						if(session->media.video_rtcp_fd != -1)
 							janus_sip_rtcp_pli_send(session);
 					}
@@ -9075,10 +9162,20 @@ static void janus_sip_rtcp_pli_send(janus_sip_session *session) {
 		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 		return;
 	}
-	if(!janus_sip_call_is_established(session))
+	if(!janus_sip_call_is_established(session)) {
+		JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] PLI skipped: call not established (status=%s)\n",
+			session->account.username, janus_sip_call_status_string(session->status));
 		return;
-	if(!session->media.has_video || session->media.video_rtcp_fd == -1)
+	}
+	if(!session->media.has_video || session->media.video_rtcp_fd == -1) {
+		JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] PLI skipped: has_video=%d rtcp_fd=%d\n",
+			session->account.username, session->media.has_video, session->media.video_rtcp_fd);
 		return;
+	}
+	JANUS_LOG(LOG_WARN, "[SIP-%s] [DIAG] PLI sending to peer via fd=%d (ssrc_local=%"SCNu32" ssrc_peer=%"SCNu32" rtcp_port=%d)\n",
+		session->account.username, session->media.video_rtcp_fd,
+		session->media.video_ssrc, session->media.video_ssrc_peer,
+		session->media.remote_video_rtcp_port);
 	/* Generate a PLI */
 	char rtcp_buf[12];
 	int rtcp_len = 12;

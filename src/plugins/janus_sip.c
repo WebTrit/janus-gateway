@@ -5040,9 +5040,13 @@ static void *janus_sip_handler(void *data) {
 				refer_to = sip_refer_to_format(session->stack->s_home, "<%s>", uri_text);
 			/* Retrieve the Contact header for manually adding if not NULL */
 			char *contact_header = janus_sip_session_contact_header_retrieve(session);
-			/* Send the REFER */
+			/* Send the REFER; NUTAG_REFER_WITH_ID creates an explicit id-tagged
+			 * subscription instead of an implicit one on s_nh_i, avoiding NOTIFY
+			 * matching failures when the handle has complex SOA state (re-INVITEs,
+			 * HOLD) that would otherwise break the implicit subscription. */
 			nua_refer(session->stack->s_nh_i,
 				SIPTAG_REFER_TO(refer_to),
+				NUTAG_REFER_WITH_ID(1),
 				TAG_IF(contact_header != NULL, SIPTAG_CONTACT_STR(contact_header)),
 				TAG_END());
 
@@ -7072,8 +7076,37 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 		}
 		case nua_r_refer: {
 			JANUS_LOG(LOG_VERB, "[%s][%s]: %d %s\n", session->account.username, nua_event_name(event), status, phrase ? phrase : "??");
-			/* We got a response to our REFER */
-			JANUS_LOG(LOG_VERB, "Response to REFER received\n");
+			if(status < 200) {
+				/* Provisional, wait for final response */
+				break;
+			}
+			/* Notify the application of the REFER response */
+			json_t *refevent = json_object();
+			json_object_set_new(refevent, "sip", json_string("event"));
+			if(session->callid)
+				json_object_set_new(refevent, "call_id", json_string(session->callid));
+			json_t *refresult = json_object();
+			if(status >= 200 && status < 300) {
+				json_object_set_new(refresult, "event", json_string("transfer_accepted"));
+			} else {
+				json_object_set_new(refresult, "event", json_string("transfer_failed"));
+			}
+			json_object_set_new(refresult, "code", json_integer(status));
+			json_object_set_new(refresult, "reason", json_string(phrase ? phrase : ""));
+			json_object_set_new(refevent, "result", refresult);
+			int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, refevent, NULL);
+			JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+			json_decref(refevent);
+			/* Also notify event handlers */
+			if(notify_events && gateway->events_is_enabled()) {
+				json_t *info = json_object();
+				json_object_set_new(info, "event", status >= 200 && status < 300 ? json_string("transfer_accepted") : json_string("transfer_failed"));
+				json_object_set_new(info, "code", json_integer(status));
+				json_object_set_new(info, "reason", json_string(phrase ? phrase : ""));
+				if(session->callid)
+					json_object_set_new(info, "call_id", json_string(session->callid));
+				gateway->notify_event(&janus_sip_plugin, session->handle, info);
+			}
 			break;
 		}
 		case nua_r_invite: {

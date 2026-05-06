@@ -1877,6 +1877,10 @@ static int janus_sip_parse_uri(janus_sip_uri_t *sip_uri, const char *data) {
 	g_strlcpy(sip_uri->data, data, JANUS_SIP_URI_MAXLEN);
 	if(url_d(sip_uri->url, sip_uri->data) < 0 || sip_uri->url->url_type != url_sip)
 		return -1;
+	/* url_d() is lenient and accepts spaces in the user part; Sofia-SIP's SIP header
+	 * parser rejects them (RFC 3261 §19.1.1), causing a cryptic error 900 in nua_invite */
+	if(sip_uri->url->url_user && strchr(sip_uri->url->url_user, ' ') != NULL)
+		return -1;
 	return 0;
 }
 

@@ -6528,18 +6528,25 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				}
 			}
 			if(reinvite && session->media.autoaccept_reinvites) {
-				if(session->media.earlymedia_video_recovery) {
-					/* Case B: re-INVITE is adding video after audio-only early media (PortaSwitch
-					 * pattern).  Do NOT auto-accept blindly — the browser must renegotiate WebRTC to
-					 * activate its video transceiver and produce a proper SDP answer.  Clear the flag
-					 * and fall through to the normal re-INVITE handling path below, which will send
-					 * an updatingcall to the browser; the browser's update answer will call
-					 * nua_respond(200, sdp) with the correct SDP body. */
-					JANUS_LOG(LOG_VERB, "earlymedia_video_recovery (Case B): re-INVITE adds video "
-						"(port=%d), bypassing auto-accept, forwarding to browser\n",
+				/* Detect a re-INVITE that adds video to an audio-only call: janus_sip_sdp_process()
+				 * above already updated has_video/local_video_rtp_port from the new offer, so
+				 * has_video=TRUE with local_video_rtp_port==0 means Janus has no video port yet. */
+				gboolean video_added_to_audio_call =
+					session->media.has_video && session->media.local_video_rtp_port == 0;
+				if(session->media.earlymedia_video_recovery || video_added_to_audio_call) {
+					/* Case B / video-add: re-INVITE is adding video — do NOT auto-accept blindly.
+					 * The browser must renegotiate WebRTC to activate its video transceiver and
+					 * produce a proper SDP answer (e.g. recvonly when no camera is available).
+					 * Clear the flag and fall through to the normal re-INVITE handling path below,
+					 * which will send an updatingcall to the browser; the browser's update answer
+					 * will call nua_respond(200, sdp) with the correct SDP body. */
+					JANUS_LOG(LOG_VERB, "re-INVITE adds video (earlymedia_video_recovery=%d, "
+						"video_added_to_audio_call=%d, port=%d): bypassing auto-accept, "
+						"forwarding to browser\n",
+						session->media.earlymedia_video_recovery, video_added_to_audio_call,
 						session->media.remote_video_rtp_port);
 					session->media.earlymedia_video_recovery = FALSE;
-					/* fall through */
+					/* fall through — forward to browser to get real SDP answer */
 				} else {
 					/* No need to involve the application: we reply ourselves */
 					nua_respond(nh, 200, sip_status_phrase(200), TAG_END());

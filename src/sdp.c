@@ -1688,15 +1688,25 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 			m->attributes = g_list_append(m->attributes, a);
 		}
 		if(m->type == JANUS_SDP_AUDIO || m->type == JANUS_SDP_VIDEO) {
+			gboolean has_real_msid = (medium->msid != NULL && medium->mstid != NULL);
+			gboolean janus_is_sending = (m->direction != JANUS_SDP_INACTIVE &&
+			                              m->direction != JANUS_SDP_RECVONLY);
 			if(m->direction != JANUS_SDP_INACTIVE) {
-				if(medium->msid && medium->mstid) {
+				if(has_real_msid) {
+					/* Plugin provided a real msid: always include it (for recvonly too,
+					 * as the remote end needs to identify the track). */
 					a = janus_sdp_attribute_create("msid", "%s %s", medium->msid, medium->mstid);
-				} else {
+					m->attributes = g_list_append(m->attributes, a);
+				} else if(janus_is_sending) {
+					/* Janus is sending media but has no plugin-provided msid: synthesize one. */
 					a = janus_sdp_attribute_create("msid", "janus janus%s", medium->mid);
+					m->attributes = g_list_append(m->attributes, a);
 				}
-				m->attributes = g_list_append(m->attributes, a);
+				/* recvonly without a real msid: do not synthesize — adding a fake msid/ssrc
+				 * on a recvonly section misleads Chrome into expecting RTP from those SSRCs,
+				 * which corrupts the audio decoder state on the peer side. */
 			}
-			if(medium->ssrc > 0) {
+			if(medium->ssrc > 0 && (has_real_msid || janus_is_sending)) {
 				a = janus_sdp_attribute_create("ssrc", "%"SCNu32" cname:janus", medium->ssrc);
 				m->attributes = g_list_append(m->attributes, a);
 				if(medium->ssrc_rtx > 0 && m->type == JANUS_SDP_VIDEO &&

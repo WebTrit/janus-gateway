@@ -3996,7 +3996,7 @@ static void *janus_sip_handler(void *data) {
 				goto error;
 			}
 			/* Send the SUBSCRIBE with Expires set to 0 */
-			nua_subscribe(nh, SIPTAG_TO_STR(to), SIPTAG_EVENT_STR(hashkey),
+			nua_subscribe(nh, SIPTAG_TO_STR(to), SIPTAG_EVENT_STR(event_type),
 				SIPTAG_EXPIRES_STR("0"), TAG_END());
 			result = json_object();
 			json_object_set_new(result, "event", json_string("unsubscribing"));

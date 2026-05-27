@@ -1681,16 +1681,17 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 			m->attributes = g_list_insert_before(m->attributes, first, a);
 		}
 		/* Add last attributes, rtcp and ssrc (msid) */
-		if(medium->ssrc_rtx > 0 && m->type == JANUS_SDP_VIDEO && janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_RFC4588_RTX) &&
-				(m->direction == JANUS_SDP_DEFAULT || m->direction == JANUS_SDP_SENDRECV || m->direction == JANUS_SDP_SENDONLY)) {
-			/* Add FID group to negotiate the RFC4588 stuff */
-			a = janus_sdp_attribute_create("ssrc-group", "FID %"SCNu32" %"SCNu32, medium->ssrc, medium->ssrc_rtx);
-			m->attributes = g_list_append(m->attributes, a);
-		}
 		if(m->type == JANUS_SDP_AUDIO || m->type == JANUS_SDP_VIDEO) {
 			gboolean has_real_msid = (medium->msid != NULL && medium->mstid != NULL);
 			gboolean janus_is_sending = (m->direction != JANUS_SDP_INACTIVE &&
 			                              m->direction != JANUS_SDP_RECVONLY);
+			if(medium->ssrc_rtx > 0 && m->type == JANUS_SDP_VIDEO && janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_RFC4588_RTX) &&
+					(has_real_msid || janus_is_sending) &&
+					(m->direction == JANUS_SDP_DEFAULT || m->direction == JANUS_SDP_SENDRECV || m->direction == JANUS_SDP_SENDONLY)) {
+				/* Add FID group to negotiate the RFC4588 stuff */
+				a = janus_sdp_attribute_create("ssrc-group", "FID %"SCNu32" %"SCNu32, medium->ssrc, medium->ssrc_rtx);
+				m->attributes = g_list_append(m->attributes, a);
+			}
 			if(m->direction != JANUS_SDP_INACTIVE) {
 				if(has_real_msid) {
 					/* Plugin provided a real msid: always include it (for recvonly too,

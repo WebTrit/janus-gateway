@@ -6470,6 +6470,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				reinvite ? "updating" : "inviting us in",
 				sip->sip_payload ? sip->sip_payload->pl_data : "(no SDP)");
 			gboolean changed = FALSE;
+			guint16 prev_remote_video_rtp_port = session->media.remote_video_rtp_port;
 			if(sdp) {
 				janus_sip_sdp_process(session, sdp, FALSE, reinvite, &changed);
 				/* Check if offer has neither audio nor video, fail with 488 */
@@ -6532,7 +6533,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				 * above already updated has_video/local_video_rtp_port from the new offer, so
 				 * has_video=TRUE with local_video_rtp_port==0 means Janus has no video port yet. */
 				gboolean video_added_to_audio_call =
-					session->media.has_video && session->media.local_video_rtp_port == 0;
+					prev_remote_video_rtp_port == 0 && session->media.remote_video_rtp_port > 0;
 				if(session->media.earlymedia_video_recovery || video_added_to_audio_call) {
 					/* Case B / video-add: re-INVITE is adding video — do NOT auto-accept blindly.
 					 * The browser must renegotiate WebRTC to activate its video transceiver and

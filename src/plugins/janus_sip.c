@@ -6529,6 +6529,13 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				}
 			}
 			if(reinvite && session->media.autoaccept_reinvites) {
+				JANUS_LOG(LOG_WARN, "reinvite autoaccept check: "
+					"prev_remote_video=%"PRIu16", cur_remote_video=%d, "
+					"local_video=%d, has_video=%d\n",
+					prev_remote_video_rtp_port,
+					session->media.remote_video_rtp_port,
+					session->media.local_video_rtp_port,
+					session->media.has_video);
 				/* Detect a re-INVITE that adds video to an audio-only call: janus_sip_sdp_process()
 				 * above already updated has_video/local_video_rtp_port from the new offer, so
 				 * has_video=TRUE with local_video_rtp_port==0 means Janus has no video port yet. */

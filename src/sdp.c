@@ -1683,6 +1683,14 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 		/* Add last attributes, rtcp and ssrc (msid) */
 		if(m->type == JANUS_SDP_AUDIO || m->type == JANUS_SDP_VIDEO) {
 			gboolean has_real_msid = (medium->msid != NULL && medium->mstid != NULL);
+			/* For answers: if video has no real msid (remote has no camera/video track),
+			 * downgrade sendrecv to recvonly. Janus has no video to send, and a sendrecv
+			 * video m-line with no declared SSRC causes Chrome to create a catch-all SSRC
+			 * receiver that intercepts audio packets with unrecognised SSRCs, breaking audio. */
+			if(!offer && m->type == JANUS_SDP_VIDEO && !has_real_msid &&
+					(m->direction == JANUS_SDP_SENDRECV || m->direction == JANUS_SDP_DEFAULT)) {
+				m->direction = JANUS_SDP_RECVONLY;
+			}
 			gboolean janus_is_sending = (m->direction != JANUS_SDP_INACTIVE &&
 			                              m->direction != JANUS_SDP_RECVONLY);
 			/* Synthesize fake msid/ssrc only when there is a real plugin msid, or

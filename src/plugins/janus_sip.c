@@ -7287,6 +7287,8 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			/* Save remote video port before processing, to detect if 200 OK adds video vs audio-only 183 */
 			int pre_sdp_process_remote_video_rtp_port = session->media.remote_video_rtp_port;
 			janus_sip_sdp_process(session, sdp, TRUE, update, &changed);
+			JANUS_LOG(LOG_WARN, "nua_r_invite sdp_process done: changed=%d, audio_recv=%d, video_recv=%d, video_send=%d\n",
+				changed, session->media.audio_recv, session->media.video_recv, session->media.video_send);
 			/* If we asked for SRTP and are not getting it, fail */
 			gboolean has_srtp = TRUE;
 			if(session->media.has_audio)
@@ -8666,6 +8668,8 @@ static void *janus_sip_relay_thread(void *data) {
 
 		if(session->media.updated) {
 			/* Apparently there was a session update, or the loop has just been entered */
+			JANUS_LOG(LOG_WARN, "relay thread reconnect: audio_rtp_fd=%d, remote_audio_port=%d, updated=%d\n",
+				session->media.audio_rtp_fd, session->media.remote_audio_rtp_port, session->media.updated);
 			session->media.updated = FALSE;
 
 			/* Resolve the addresses, if needed */

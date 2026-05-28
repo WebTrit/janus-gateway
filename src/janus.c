@@ -4182,7 +4182,9 @@ json_t *janus_plugin_handle_sdp(janus_plugin_session *plugin_session, janus_plug
 		}
 	}
 	/* Enrich the SDP the plugin gave us with all the WebRTC related stuff */
+	JANUS_LOG(LOG_WARN, "plugin_handle_sdp type=%s sdp_start=%.200s\n", sdp_type, sdp);
 	char *sdp_merged = janus_sdp_merge(ice_handle, parsed_sdp, offer ? TRUE : FALSE);
+	if(sdp_merged) JANUS_LOG(LOG_WARN, "sdp_merged_start=%.500s\n", sdp_merged);
 	if(sdp_merged == NULL) {
 		/* Couldn't merge SDP */
 		JANUS_LOG(LOG_ERR, "[%"SCNu64"] Error merging SDP\n", ice_handle->handle_id);

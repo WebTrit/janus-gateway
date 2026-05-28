@@ -1701,13 +1701,6 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 			 * Chrome into expecting RTP from those SSRCs, which corrupts audio. */
 			gboolean should_synthesize = has_real_msid ||
 			    (janus_is_sending && m->type == JANUS_SDP_AUDIO);
-			JANUS_LOG(LOG_WARN, "sdp_merge: type=%s direction=%d has_real_msid=%d janus_is_sending=%d should_synthesize=%d ssrc=%"SCNu32"\n",
-			    m->type == JANUS_SDP_AUDIO ? "audio" : "video",
-			    m->direction,
-			    has_real_msid,
-			    janus_is_sending,
-			    should_synthesize,
-			    medium ? medium->ssrc : 0);
 			if(medium->ssrc_rtx > 0 && m->type == JANUS_SDP_VIDEO && janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_RFC4588_RTX) &&
 					has_real_msid &&
 					(m->direction == JANUS_SDP_DEFAULT || m->direction == JANUS_SDP_SENDRECV || m->direction == JANUS_SDP_SENDONLY)) {

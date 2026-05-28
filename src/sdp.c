@@ -1685,8 +1685,23 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 			gboolean has_real_msid = (medium->msid != NULL && medium->mstid != NULL);
 			gboolean janus_is_sending = (m->direction != JANUS_SDP_INACTIVE &&
 			                              m->direction != JANUS_SDP_RECVONLY);
+			/* Synthesize fake msid/ssrc only when there is a real plugin msid, or
+			 * when Janus is sending audio (needed for SIP interoperability).
+			 * For video without a real msid we suppress all fake synthesis: a fake
+			 * msid/ssrc on a video m-line where the remote side has no camera
+			 * (e.g. Firefox answering a video upgrade with no a=msid) confuses
+			 * Chrome into expecting RTP from those SSRCs, which corrupts audio. */
+			gboolean should_synthesize = has_real_msid ||
+			    (janus_is_sending && m->type == JANUS_SDP_AUDIO);
+			JANUS_LOG(LOG_WARN, "sdp_merge: type=%s direction=%d has_real_msid=%d janus_is_sending=%d should_synthesize=%d ssrc=%"SCNu32"\n",
+			    m->type == JANUS_SDP_AUDIO ? "audio" : "video",
+			    m->direction,
+			    has_real_msid,
+			    janus_is_sending,
+			    should_synthesize,
+			    medium ? medium->ssrc : 0);
 			if(medium->ssrc_rtx > 0 && m->type == JANUS_SDP_VIDEO && janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_RFC4588_RTX) &&
-					(has_real_msid || janus_is_sending) &&
+					has_real_msid &&
 					(m->direction == JANUS_SDP_DEFAULT || m->direction == JANUS_SDP_SENDRECV || m->direction == JANUS_SDP_SENDONLY)) {
 				/* Add FID group to negotiate the RFC4588 stuff */
 				a = janus_sdp_attribute_create("ssrc-group", "FID %"SCNu32" %"SCNu32, medium->ssrc, medium->ssrc_rtx);
@@ -1698,8 +1713,10 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 					 * as the remote end needs to identify the track). */
 					a = janus_sdp_attribute_create("msid", "%s %s", medium->msid, medium->mstid);
 					m->attributes = g_list_append(m->attributes, a);
-				} else if(janus_is_sending) {
-					/* Janus is sending media but has no plugin-provided msid: synthesize one. */
+				} else if(janus_is_sending && m->type == JANUS_SDP_AUDIO) {
+					/* Janus is sending audio but has no plugin-provided msid: synthesize one.
+					 * We do NOT synthesize for video: a fake video msid without a real track
+					 * confuses Chrome on the peer side. */
 					a = janus_sdp_attribute_create("msid", "janus janus%s", medium->mid);
 					m->attributes = g_list_append(m->attributes, a);
 				}
@@ -1707,7 +1724,7 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 				 * on a recvonly section misleads Chrome into expecting RTP from those SSRCs,
 				 * which corrupts the audio decoder state on the peer side. */
 			}
-			if(medium->ssrc > 0 && (has_real_msid || janus_is_sending)) {
+			if(medium->ssrc > 0 && should_synthesize) {
 				a = janus_sdp_attribute_create("ssrc", "%"SCNu32" cname:janus", medium->ssrc);
 				m->attributes = g_list_append(m->attributes, a);
 				if(medium->ssrc_rtx > 0 && m->type == JANUS_SDP_VIDEO &&

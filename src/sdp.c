@@ -409,6 +409,18 @@ int janus_sdp_process_remote(void *ice_handle, janus_sdp *remote_sdp, gboolean r
 				JANUS_LOG(LOG_INFO, "[%"SCNu64"] ICE restart detected\n", handle->handle_id);
 				janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ALL_TRICKLES);
 				janus_flags_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
+				/* Record whether the peer's DTLS fingerprint changed too. A plain ICE
+				 * restart on the same PeerConnection (e.g. network handover) keeps the
+				 * same cert; a fresh PeerConnection (e.g. after process kill) brings a
+				 * new one. The DTLS-recreate path uses this to decide whether to throw
+				 * away the still-working SSL* context. */
+				if(janus_is_webrtc_encryption_enabled() && rfingerprint != NULL &&
+						pc->remote_fingerprint != NULL &&
+						g_strcmp0(pc->remote_fingerprint, rfingerprint) != 0) {
+					janus_flags_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_DTLS_FINGERPRINT_CHANGED);
+				} else {
+					janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_DTLS_FINGERPRINT_CHANGED);
+				}
 			}
 			/* Store fingerprint and hashing */
 			if(janus_is_webrtc_encryption_enabled()) {

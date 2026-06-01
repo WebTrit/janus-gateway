@@ -3917,6 +3917,17 @@ void janus_ice_restart(janus_ice_handle *handle) {
 	/* Clear the restart flag now: it signals "restart was requested", not "DTLS is ready". */
 	janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_ICE_RESTART);
 	if(dtls_recreate_on_ice_restart) {
+		/* Skip DTLS recreate when the peer's certificate did not change. A plain ICE
+		 * restart (network handover on the same PeerConnection) keeps the same SSL*
+		 * context valid over the new candidate pair; recreating here would force a
+		 * fresh ClientHello that the peer's still-active DTLS server would reject as
+		 * an RFC 5746 renegotiation, breaking media. */
+		if(!janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_DTLS_FINGERPRINT_CHANGED)) {
+			JANUS_LOG(LOG_INFO, "[%"SCNu64"] DTLS fingerprint unchanged on ICE restart, keeping existing stack\n",
+				handle->handle_id);
+			return;
+		}
+		janus_flags_clear(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_DTLS_FINGERPRINT_CHANGED);
 		/* Schedule DTLS destroy/create on the handle's GLib main loop.
 		 * janus_ice_cb_nice_recv also runs on this loop, so the two operations
 		 * are serialized by the event loop dispatcher — no concurrent access to pc->dtls. */

@@ -190,8 +190,11 @@ gboolean janus_ice_is_hangup_on_failed_enabled(void) {
 /* Whether to recreate the DTLS stack on ICE restart. When a peer's process is killed
  * during an active call and reconnects via ICE restart, the existing SSL* object rejects
  * the fresh ClientHello as an RFC 5746 renegotiation, leaving DTLS stuck. Enabling this
- * destroys and recreates the DTLS stack on ICE restart so the new handshake completes. */
-static gboolean dtls_recreate_on_ice_restart = FALSE;
+ * destroys and recreates the DTLS stack on ICE restart so the new handshake completes.
+ * Default ON: the recreate path is now gated by a fingerprint-change check (see
+ * janus_ice_restart()), so plain ICE restarts with the same peer cert keep the existing
+ * stack and only true peer-cert rotations (process kill / restoration) trigger a recreate. */
+static gboolean dtls_recreate_on_ice_restart = TRUE;
 
 void janus_ice_set_dtls_recreate_on_ice_restart_enabled(gboolean enabled) {
 	dtls_recreate_on_ice_restart = enabled;

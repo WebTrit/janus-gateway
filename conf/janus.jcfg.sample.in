@@ -307,7 +307,13 @@ nat: {
 
 	# Recreate the DTLS stack on ICE restart so a fresh ClientHello from a
 	# reconnecting peer is treated as a new handshake rather than renegotiation.
-	#dtls_recreate_on_ice_restart = false
+	# Default ON: the recreate is now skipped automatically when the peer's
+	# a=fingerprint did not change between the previous and the current remote
+	# SDP (i.e. plain ICE restart on the same PeerConnection keeps the existing
+	# SSL* alive). Only a true peer-cert rotation (e.g. process kill + reopen)
+	# triggers a recreate. Set to false to fall back to the legacy behaviour
+	# where DTLS is never recreated on ICE restart.
+	#dtls_recreate_on_ice_restart = true
 
 	# By default Janus tries to resolve mDNS (.local) candidates: even
 	# though this is now done asynchronously and shouldn't keep the API

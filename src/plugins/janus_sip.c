@@ -1112,6 +1112,10 @@ static int dscp_video_rtp = 0;
 static char *sips_certs_dir = NULL;
 #define JANUS_DEFAULT_SIP_TIMER_T1X64 32000
 static int sip_timer_t1x64 = JANUS_DEFAULT_SIP_TIMER_T1X64;
+#define JANUS_DEFAULT_TCP_KEEPALIVE_INTERVAL 30000
+static int tcp_keepalive_interval = JANUS_DEFAULT_TCP_KEEPALIVE_INTERVAL;
+#define JANUS_DEFAULT_TCP_PINGPONG_TIMEOUT 10000
+static int tcp_pingpong_timeout = JANUS_DEFAULT_TCP_PINGPONG_TIMEOUT;
 static uint16_t dtmf_keys[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#', 'A', 'B', 'C', 'D'};
 
 static gboolean query_contact_header = FALSE;
@@ -2313,6 +2317,26 @@ int janus_sip_init(janus_callbacks *callback, const char *config_path) {
 			sip_timer_t1x64 = JANUS_DEFAULT_SIP_TIMER_T1X64;
 		} else {
 			JANUS_LOG(LOG_VERB, "SIP Timer T1X64 set to %d milliseconds\n", sip_timer_t1x64);
+		}
+
+		item = janus_config_get(config, config_general, janus_config_type_item, "tcp_keepalive_interval");
+		if(item && item->value)
+			tcp_keepalive_interval = atoi(item->value);
+		if(tcp_keepalive_interval < 0) {
+			JANUS_LOG(LOG_ERR, "Invalid TCP keepalive interval: %d (falling back to default)\n", tcp_keepalive_interval);
+			tcp_keepalive_interval = JANUS_DEFAULT_TCP_KEEPALIVE_INTERVAL;
+		} else {
+			JANUS_LOG(LOG_VERB, "TCP keepalive interval set to %d milliseconds\n", tcp_keepalive_interval);
+		}
+
+		item = janus_config_get(config, config_general, janus_config_type_item, "tcp_pingpong_timeout");
+		if(item && item->value)
+			tcp_pingpong_timeout = atoi(item->value);
+		if(tcp_pingpong_timeout < 0) {
+			JANUS_LOG(LOG_ERR, "Invalid TCP ping/pong timeout: %d (falling back to default)\n", tcp_pingpong_timeout);
+			tcp_pingpong_timeout = JANUS_DEFAULT_TCP_PINGPONG_TIMEOUT;
+		} else {
+			JANUS_LOG(LOG_VERB, "TCP ping/pong timeout set to %d milliseconds\n", tcp_pingpong_timeout);
 		}
 
 		item = janus_config_get(config, config_general, janus_config_type_item, "register_ttl");
@@ -6315,7 +6339,12 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			break;
 		}
 		case nua_i_outbound:
-			JANUS_LOG(LOG_VERB, "[%s][%s]: %d %s\n", session->account.username, nua_event_name(event), status, phrase ? phrase : "??");
+			if(status >= 400 || status == 0) {
+				JANUS_LOG(LOG_WARN, "[%s] Outbound keepalive failed (%d %s)\n",
+					session->account.username, status, phrase ? phrase : "??");
+			} else {
+				JANUS_LOG(LOG_VERB, "[%s][%s]: %d %s\n", session->account.username, nua_event_name(event), status, phrase ? phrase : "??");
+			}
 			break;
 		case nua_i_bye: {
 			JANUS_LOG(LOG_VERB, "[%s][%s]: %d %s\n", session->account.username, nua_event_name(event), status, phrase ? phrase : "??");
@@ -9114,6 +9143,8 @@ gpointer janus_sip_sofia_thread(gpointer user_data) {
 				SIPTAG_SUPPORTED(NULL),
 				NTATAG_CANCEL_2543(session->account.rfc2543_cancel),
 				NTATAG_SIP_T1X64(sip_timer_t1x64),
+				TPTAG_KEEPALIVE(tcp_keepalive_interval),	/* RFC 5626: send CRLF ping every N ms on TCP */
+				TPTAG_PINGPONG(tcp_pingpong_timeout),		/* RFC 5626: close TCP if PONG not received within N ms */
 				TAG_NULL());
 	if(query_contact_header)
 		nua_get_params(session->stack->s_nua, SIPTAG_FROM_STR(""), TAG_END());

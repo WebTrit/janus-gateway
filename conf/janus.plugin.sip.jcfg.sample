@@ -52,4 +52,16 @@ general: {
 	# engine (default 32000 milliseconds)
 	sip_timer_t1x64 = 32000
 
+	# TCP transport-level keepalive (RFC 5626 CRLF ping/pong).
+	# Interval between CRLF pings sent on the Janus->PBX TCP connection (ms).
+	# When a ping goes unanswered for tcp_pingpong_timeout ms, Sofia closes the
+	# dead TCP and immediately triggers a fresh REGISTER on a new connection,
+	# updating the Contact in the registrar. Set to 0 to disable (default 30000).
+	tcp_keepalive_interval = 30000
+
+	# Timeout for expecting a PONG response to a CRLF ping (ms).
+	# If no PONG arrives within this window the TCP connection is considered dead
+	# and closed, triggering automatic re-registration (default 10000).
+	tcp_pingpong_timeout = 10000
+
 }

@@ -280,6 +280,7 @@ typedef struct janus_ice_trickle janus_ice_trickle;
 #define JANUS_ICE_HANDLE_WEBRTC_RFC4588_RTX			(1 << 19)
 #define JANUS_ICE_HANDLE_WEBRTC_NEW_DATACHAN_SDP	(1 << 20)
 #define JANUS_ICE_HANDLE_WEBRTC_E2EE				(1 << 21)
+#define JANUS_ICE_HANDLE_WEBRTC_DTLS_FINGERPRINT_CHANGED	(1 << 22)
 
 
 /*! \brief Janus media types */

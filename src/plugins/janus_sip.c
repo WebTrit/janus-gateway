@@ -7265,6 +7265,31 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				JANUS_LOG(LOG_VERB, "Handling SDP answer in ACK\n");
 			} else if(status >= 400 && status != 700) {
 				janus_sip_save_reason(sip, session);
+				/* If this is a failed re-INVITE (RFC 3261 §14.1), notify the application
+				 * so it can retry (e.g. on 491 Request Pending). Initial call failures
+				 * don't reach here while in incall_reinviting status. */
+				if(session->status == janus_sip_call_status_incall_reinviting) {
+					json_t *event = json_object();
+					json_object_set_new(event, "sip", json_string("event"));
+					json_t *result = json_object();
+					json_object_set_new(result, "event", json_string("declining"));
+					json_object_set_new(result, "code", json_integer(status));
+					if(session->callid)
+						json_object_set_new(result, "call_id", json_string(session->callid));
+					json_object_set_new(event, "result", result);
+					json_object_set_new(event, "call_id", json_string(session->callid));
+					int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, event, NULL);
+					JANUS_LOG(LOG_VERB, "  >> Pushing re-INVITE failure event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+					json_decref(event);
+					if(notify_events && gateway->events_is_enabled()) {
+						json_t *info = json_object();
+						json_object_set_new(info, "event", json_string("declining"));
+						if(session->callid)
+							json_object_set_new(info, "call-id", json_string(session->callid));
+						json_object_set_new(info, "code", json_integer(status));
+						gateway->notify_event(&janus_sip_plugin, session->handle, info);
+					}
+				}
 				break;
 			}
 			if(ssip == NULL) {

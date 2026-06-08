@@ -7277,7 +7277,8 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					if(session->callid)
 						json_object_set_new(result, "call_id", json_string(session->callid));
 					json_object_set_new(event, "result", result);
-					json_object_set_new(event, "call_id", json_string(session->callid));
+					if(session->callid)
+						json_object_set_new(event, "call_id", json_string(session->callid));
 					int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, event, NULL);
 					JANUS_LOG(LOG_VERB, "  >> Pushing re-INVITE failure event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
 					json_decref(event);

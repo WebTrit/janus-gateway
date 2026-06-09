@@ -2791,8 +2791,19 @@ void janus_sip_destroy_session(janus_plugin_session *handle, int *error) {
 	/* Shutdown the NUA */
 	if(session->stack) {
 		janus_mutex_lock(&session->stack->smutex);
-		if(session->stack->s_nua)
+		if(session->stack->s_nua) {
+			/* Explicitly remove all Contact bindings for this AOR before shutdown.
+			 * Contact:* + Expires:0 is an RFC 3261 bulk-deregister that also clears
+			 * stale bindings left by previous sessions whose UNREGISTER was lost. */
+			if(session->stack->s_nh_r != NULL &&
+					session->account.registration_status >= janus_sip_registration_status_registering) {
+				nua_unregister(session->stack->s_nh_r,
+					SIPTAG_CONTACT_STR("*"),
+					SIPTAG_EXPIRES_STR("0"),
+					TAG_END());
+			}
 			nua_shutdown(session->stack->s_nua);
+		}
 		janus_mutex_unlock(&session->stack->smutex);
 	}
 	if(session->unique_id)

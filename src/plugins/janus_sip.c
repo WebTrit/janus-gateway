@@ -5079,6 +5079,11 @@ static void *janus_sip_handler(void *data) {
 				refer_to = sip_refer_to_format(session->stack->s_home, "<%s>", uri_text);
 			/* Retrieve the Contact header for manually adding if not NULL */
 			char *contact_header = janus_sip_session_contact_header_retrieve(session);
+			/* Save the transaction so nua_r_refer can push transfer_accepted /
+			 * transfer_failed with the correct transaction ID (same pattern as
+			 * the call and accept handlers). */
+			g_free(session->transaction);
+			session->transaction = msg->transaction ? g_strdup(msg->transaction) : NULL;
 			/* Send the REFER; NUTAG_REFER_WITH_ID creates an explicit id-tagged
 			 * subscription instead of an implicit one on s_nh_i, avoiding NOTIFY
 			 * matching failures when the handle has complex SOA state (re-INVITEs,

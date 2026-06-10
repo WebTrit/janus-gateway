@@ -6621,6 +6621,26 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			/* Notify the application about the new incoming call or re-INVITE */
 			json_t *jsep = NULL;
 			if(sdp) {
+				/* WT-1606: downgrade video sendrecv→recvonly when the SIP peer has no video
+				 * sender (no a=msid). Mirrors the answer-side guard in janus_sdp_merge (WT-1541).
+				 * Without this, Chrome creates a catch-all SSRC bucket for the video m-line that
+				 * absorbs unrecognized audio SSRCs and silences audio after attended transfer. */
+				janus_sdp_mline *video_ml = janus_sdp_mline_find(sdp, JANUS_SDP_VIDEO);
+				if(video_ml && (video_ml->direction == JANUS_SDP_SENDRECV ||
+						video_ml->direction == JANUS_SDP_DEFAULT)) {
+					gboolean has_video_msid = FALSE;
+					GList *la = video_ml->attributes;
+					while(la) {
+						janus_sdp_attribute *a = (janus_sdp_attribute *)la->data;
+						if(a->name && !strcasecmp(a->name, "msid")) {
+							has_video_msid = TRUE;
+							break;
+						}
+						la = la->next;
+					}
+					if(!has_video_msid)
+						video_ml->direction = JANUS_SDP_RECVONLY;
+				}
 				/* Generate a cleaned SDP string (without m=text) for the browser */
 				char *clean_sdp = janus_sdp_write(sdp);
 				jsep = json_pack("{ssss}", "type", "offer", "sdp",

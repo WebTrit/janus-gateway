@@ -4894,6 +4894,14 @@ static void *janus_sip_handler(void *data) {
 					SOATAG_RTP_SELECT(SOA_RTP_SELECT_COMMON),
 					NUTAG_AUTOANSWER(0),
 					TAG_END());
+				/* If this re-INVITE did not add a new video track (video_added=FALSE,
+				 * so media.updated was not set above), Chrome may need a fresh keyframe
+				 * after the SDP renegotiation.  Arm the deferred PLI so the relay thread
+				 * fires it on the next incoming video packet; the PLI may arrive while
+				 * Chrome is still mid-renegotiation, but that is harmless — the peer
+				 * will emit a keyframe that Chrome can consume once it is ready. */
+				if(!video_added && session->media.has_video && session->media.video_recv)
+					session->media.video_recv_pli_pending = TRUE;
 			}
 			g_free(sdp);
 			/* Send an ack back */

@@ -6477,13 +6477,21 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			}
 			/* Check if there's an SDP to process */
 			janus_sdp *sdp = NULL;
+			/* Sofia's pl_data is bounded by pl_len and is NOT guaranteed to be
+			 * NUL-terminated at the body boundary: over TCP a following SIP message
+			 * (e.g. a NOTIFY) can be pipelined right after the SDP in the same buffer.
+			 * Copy exactly pl_len bytes so neither the parser nor the diagnostic log
+			 * below read past the body into the next message (WT-1659). */
+			char *sdp_text = NULL;
 			if(!sip->sip_payload) {
 				JANUS_LOG(LOG_VERB,"Received offerless %s\n", reinvite ? "re-INVITE" : "INVITE");
 			} else {
 				char sdperror[100];
-				sdp = janus_sdp_parse(sip->sip_payload->pl_data, sdperror, sizeof(sdperror));
+				sdp_text = g_strndup(sip->sip_payload->pl_data, sip->sip_payload->pl_len);
+				sdp = janus_sdp_parse(sdp_text, sdperror, sizeof(sdperror));
 				if(!sdp) {
 					JANUS_LOG(LOG_ERR, "\tError parsing SDP! %s\n", sdperror);
+					g_free(sdp_text);
 					g_atomic_int_set(&session->establishing, 0);
 					nua_respond(nh, 488, sip_status_phrase(488), TAG_END());
 					break;
@@ -6521,7 +6529,8 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			/* Parse SDP */
 			JANUS_LOG(LOG_VERB, "Someone is %s a call:\n%s",
 				reinvite ? "updating" : "inviting us in",
-				sip->sip_payload ? sip->sip_payload->pl_data : "(no SDP)");
+				sdp_text ? sdp_text : "(no SDP)");
+			g_free(sdp_text);
 			gboolean changed = FALSE;
 			guint16 prev_remote_video_rtp_port = session->media.remote_video_rtp_port;
 			if(sdp) {
@@ -6654,11 +6663,14 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					if(!has_video_msid)
 						video_ml->direction = JANUS_SDP_RECVONLY;
 				}
-				/* Generate a cleaned SDP string (without m=text) for the browser */
+				/* Generate a cleaned SDP string (without m=text) for the browser.
+				 * Do NOT fall back to raw pl_data: it isn't bounded to pl_len and would
+				 * leak a pipelined SIP message's bytes to the browser over TCP (WT-1659). */
 				char *clean_sdp = janus_sdp_write(sdp);
-				jsep = json_pack("{ssss}", "type", "offer", "sdp",
-					clean_sdp ? clean_sdp : sip->sip_payload->pl_data);
-				g_free(clean_sdp);
+				if(clean_sdp) {
+					jsep = json_pack("{ssss}", "type", "offer", "sdp", clean_sdp);
+					g_free(clean_sdp);
+				}
 			}
 			json_t *call = json_object();
 			json_object_set_new(call, "sip", json_string("event"));
@@ -6818,7 +6830,9 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				return;
 			}
 			const char *type = sip->sip_content_type->c_type;
-			char *payload = sip->sip_payload->pl_data;
+			/* Bound to pl_len: pl_data isn't NUL-terminated at the body boundary when
+			 * another SIP message is pipelined behind it over TCP (WT-1659). */
+			char *payload = g_strndup(sip->sip_payload->pl_data, sip->sip_payload->pl_len);
 			/* Notify the application */
 			json_t *info = json_object();
 			json_object_set_new(info, "sip", json_string("event"));
@@ -6832,6 +6846,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			}
 			json_object_set_new(result, "type", json_string(type));
 			json_object_set_new(result, "content", json_string(payload));
+			g_free(payload);
 			if(session->incoming_header_prefixes) {
 				json_t *headers = janus_sip_get_incoming_headers(sip, session);
 				json_object_set_new(result, "headers", headers);
@@ -6851,7 +6866,9 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				return;
 			}
 			const char *content_type = sip->sip_content_type->c_type;
-			char *payload = sip->sip_payload->pl_data;
+			/* Bound to pl_len: pl_data isn't NUL-terminated at the body boundary when
+			 * another SIP message is pipelined behind it over TCP (WT-1659). */
+			char *payload = g_strndup(sip->sip_payload->pl_data, sip->sip_payload->pl_len);
 			/* Notify the application */
 			json_t *message = json_object();
 			json_object_set_new(message, "sip", json_string("event"));
@@ -6864,6 +6881,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				json_object_set_new(result, "displayname", json_string(sip->sip_from->a_display));
 			}
 			json_object_set_new(result, "content", json_string(payload));
+			g_free(payload);
 			if(session->incoming_header_prefixes) {
 				json_t *headers = janus_sip_get_incoming_headers(sip, session);
 				json_object_set_new(result, "headers", headers);
@@ -6909,7 +6927,11 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			}
 			if(sip->sip_content_type != NULL)
 				json_object_set_new(result, "content-type", json_string(sip->sip_content_type->c_type));
-			json_object_set_new(result, "content", json_string(sip->sip_payload->pl_data));
+			/* Bound to pl_len: pl_data isn't NUL-terminated at the body boundary when
+			 * another SIP message is pipelined behind it over TCP (WT-1659). */
+			char *notify_content = g_strndup(sip->sip_payload->pl_data, sip->sip_payload->pl_len);
+			json_object_set_new(result, "content", json_string(notify_content));
+			g_free(notify_content);
 			if(session->incoming_header_prefixes) {
 				json_t *headers = janus_sip_get_incoming_headers(sip, session);
 				json_object_set_new(result, "headers", headers);
@@ -7348,9 +7370,17 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				break;
 			}
 			char sdperror[100];
-			janus_sdp *sdp = janus_sdp_parse(sip->sip_payload->pl_data, sdperror, sizeof(sdperror));
+			/* Sofia's pl_data is bounded by pl_len and is NOT guaranteed to be
+			 * NUL-terminated at the body boundary: over TCP a following SIP message
+			 * (e.g. a NOTIFY to the registered Contact) can be pipelined right after
+			 * the SDP in the same buffer, so a NUL-terminated read walks past the body
+			 * into the next message. Copy exactly pl_len bytes; this fixed_sdp also
+			 * backs codec detection and the SDP forwarded to the peer below (WT-1659). */
+			char *fixed_sdp = g_strndup(sip->sip_payload->pl_data, sip->sip_payload->pl_len);
+			janus_sdp *sdp = janus_sdp_parse(fixed_sdp, sdperror, sizeof(sdperror));
 			if(!sdp) {
 				JANUS_LOG(LOG_ERR, "\tError parsing SDP! %s\n", sdperror);
+				g_free(fixed_sdp);
 				nua_respond(nh, 488, sip_status_phrase(488), TAG_END());
 				break;
 			}
@@ -7371,9 +7401,8 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					su_free(session->stack->s_home, route);
 			}
 			/* Parse SDP */
-			JANUS_LOG(LOG_VERB, "Peer accepted our call:\n%s", sip->sip_payload->pl_data);
+			JANUS_LOG(LOG_VERB, "Peer accepted our call:\n%s", fixed_sdp);
 			janus_sip_call_update_status(session, janus_sip_call_status_incall);
-			char *fixed_sdp = sip->sip_payload->pl_data;
 			gboolean changed = FALSE;
 			gboolean update = session->media.ready;
 			/* Save remote video port before processing, to detect if 200 OK adds video vs audio-only 183 */
@@ -7388,6 +7417,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			if(session->media.require_srtp && !has_srtp) {
 				JANUS_LOG(LOG_ERR, "We asked for mandatory SRTP but didn't get any in the reply!\n");
 				janus_sdp_destroy(sdp);
+				g_free(fixed_sdp);
 				/* Hangup immediately */
 				session->media.earlymedia = FALSE;
 				session->media.earlymedia_video_recovery = FALSE;
@@ -7408,6 +7438,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				/* No remote address parsed? Give up */
 				JANUS_LOG(LOG_ERR, "\tNo remote IP address found for RTP, something's wrong with the SDP!\n");
 				janus_sdp_destroy(sdp);
+				g_free(fixed_sdp);
 				/* Hangup immediately */
 				session->media.earlymedia = FALSE;
 				session->media.earlymedia_video_recovery = FALSE;
@@ -7476,6 +7507,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					JANUS_LOG(LOG_VERB, "This is an update to an existing call (possibly in response to hold/unhold)\n");
 				}
 				janus_sdp_destroy(sdp);
+				g_free(fixed_sdp);
 				break;
 			}
 			if(!session->media.earlymedia && !session->media.update) {
@@ -7606,6 +7638,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				/* We just received a 200 OK to an update we sent */
 				session->media.update = FALSE;
 			}
+			g_free(fixed_sdp);
 			break;
 		}
 		case nua_r_register:

@@ -7491,8 +7491,14 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					json_t *unhold_result = json_object();
 					json_object_set_new(unhold_result, "event", json_string("updatingcall"));
 					json_object_set_new(unhold_result, "username", json_string(session->callee));
-					if(session->account.identity)
-						json_object_set_new(unhold_result, "callee", json_string(session->account.identity));
+					/* Helper sessions have a NULL account.identity (only the master registers an
+					 * identity); fall back to the master's identity so the synthetic updatingcall
+					 * always carries a valid "callee" URI. Otherwise the application parses a nil
+					 * URI and its controller crashes, tearing down all of the user's calls (WT-1670). */
+					const char *unhold_local_identity = session->account.identity ? session->account.identity :
+						(session->master ? session->master->account.identity : NULL);
+					if(unhold_local_identity)
+						json_object_set_new(unhold_result, "callee", json_string(unhold_local_identity));
 					if(session->callid)
 						json_object_set_new(unhold_result, "call_id", json_string(session->callid));
 					json_object_set_new(unhold_call, "result", unhold_result);
@@ -7605,8 +7611,12 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				json_t *update_result = json_object();
 				json_object_set_new(update_result, "event", json_string("updatingcall"));
 				json_object_set_new(update_result, "username", json_string(session->callee));
-				if(session->account.identity)
-					json_object_set_new(update_result, "callee", json_string(session->account.identity));
+				/* See WT-1670: helper sessions have a NULL account.identity; fall back to the
+				 * master's identity so "callee" is always a valid URI for the application. */
+				const char *update_local_identity = session->account.identity ? session->account.identity :
+					(session->master ? session->master->account.identity : NULL);
+				if(update_local_identity)
+					json_object_set_new(update_result, "callee", json_string(update_local_identity));
 				if(session->callid)
 					json_object_set_new(update_result, "call_id", json_string(session->callid));
 				json_object_set_new(update_call, "result", update_result);

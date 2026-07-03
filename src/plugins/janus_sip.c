@@ -1312,6 +1312,12 @@ typedef struct janus_sip_media {
 	int video_orientation_extension_id;
 	int audio_level_extension_id;
 	int dtmf_pt;
+	/* a=msid first presented to the browser per m-line; re-presented on every
+	 * later SDP so the receiver track never leaves the MediaStream the
+	 * application is playing. The _set flag records that a baseline exists even
+	 * when it is "no msid" (the core then synthesizes a stable default) (WT-1606) */
+	char *browser_audio_msid, *browser_video_msid;
+	gboolean browser_audio_msid_set, browser_video_msid_set;
 } janus_sip_media;
 
 typedef struct janus_sip_dtmf {
@@ -1838,6 +1844,12 @@ static void janus_sip_media_reset(janus_sip_session *session) {
 	session->media.video_orientation_extension_id = -1;
 	session->media.audio_level_extension_id = -1;
 	session->media.dtmf_pt = -1;
+	g_free(session->media.browser_audio_msid);
+	session->media.browser_audio_msid = NULL;
+	g_free(session->media.browser_video_msid);
+	session->media.browser_video_msid = NULL;
+	session->media.browser_audio_msid_set = FALSE;
+	session->media.browser_video_msid_set = FALSE;
 	janus_rtp_switching_context_reset(&session->media.acontext);
 	janus_rtp_switching_context_reset(&session->media.vcontext);
 	/* Free any stored text m-lines from a previous call */
@@ -1850,6 +1862,88 @@ static void janus_sip_media_reset(janus_sip_session *session) {
 		g_list_free(session->text_mlines);
 		session->text_mlines = NULL;
 	}
+}
+
+/* WT-1606: a=msid tells the browser which MediaStream a receiver track belongs
+ * to. PortaSIP rewrites or drops it whenever the call is re-bridged (attended
+ * transfer, MoH), and a changed/missing msid on a renegotiation makes the
+ * browser move the track out of the MediaStream the application is playing —
+ * audio goes silent even though RTP keeps flowing. Remember the msid first
+ * presented to the browser per m-line and re-present it on every later SDP:
+ * for the browser the stream identity must survive whatever happens on the
+ * SIP side of the bridge. Returns TRUE if the SDP was modified. */
+static gboolean janus_sip_stabilize_browser_msid(janus_sip_session *session, janus_sdp *sdp) {
+	if(session == NULL || sdp == NULL)
+		return FALSE;
+	gboolean changed = FALSE;
+	GList *ml = sdp->m_lines;
+	while(ml) {
+		janus_sdp_mline *m = (janus_sdp_mline *)ml->data;
+		ml = ml->next;
+		if(m->type != JANUS_SDP_AUDIO && m->type != JANUS_SDP_VIDEO)
+			continue;
+		/* msid only matters on m-lines where the SIP peer sends media */
+		if(m->port == 0 || m->direction == JANUS_SDP_RECVONLY || m->direction == JANUS_SDP_INACTIVE)
+			continue;
+		char **stored = (m->type == JANUS_SDP_AUDIO) ?
+			&session->media.browser_audio_msid : &session->media.browser_video_msid;
+		gboolean *stored_set = (m->type == JANUS_SDP_AUDIO) ?
+			&session->media.browser_audio_msid_set : &session->media.browser_video_msid_set;
+		janus_sdp_attribute *msid = NULL;
+		GList *la = m->attributes;
+		while(la) {
+			janus_sdp_attribute *a = (janus_sdp_attribute *)la->data;
+			if(a->name && !strcasecmp(a->name, "msid")) {
+				msid = a;
+				break;
+			}
+			la = la->next;
+		}
+		if(!*stored_set) {
+			/* First track the browser sees on this m-line: remember its msid.
+			 * "No msid" is a baseline too — the core then synthesizes a stable
+			 * default, so a real msid appearing later must also be suppressed. */
+			*stored_set = TRUE;
+			if(msid && msid->value)
+				*stored = g_strdup(msid->value);
+			continue;
+		}
+		gboolean matches = (*stored == NULL) ?
+			(msid == NULL) :
+			(msid != NULL && msid->value != NULL && !strcmp(msid->value, *stored));
+		if(matches)
+			continue;
+		if(*stored == NULL && m->type == JANUS_SDP_VIDEO && msid && msid->value) {
+			/* Video baseline is "no msid" but a real msid appeared: adopt it as the
+			 * new baseline instead of stripping. The core synthesizes a stable default
+			 * msid only for audio; stripping here would hand the browser a sendrecv
+			 * video offer with no msid at all — the catch-all shape the WT-1541/WT-1606
+			 * downgrades guard against — and offers are not covered by the core's
+			 * answer-side downgrade. Adoption matches pre-fix behavior for this rare
+			 * case and gives later renegotiations a stable value to enforce. */
+			*stored = g_strdup(msid->value);
+			continue;
+		}
+		JANUS_LOG(LOG_INFO, "[SIP-%s] Stabilizing %s msid towards browser: '%s' -> '%s'\n",
+			session->account.username ? session->account.username : "??",
+			m->type == JANUS_SDP_AUDIO ? "audio" : "video",
+			(msid && msid->value) ? msid->value : "(none)",
+			*stored ? *stored : "(none)");
+		la = m->attributes;
+		while(la) {
+			GList *next = la->next;
+			janus_sdp_attribute *a = (janus_sdp_attribute *)la->data;
+			if(a->name && !strcasecmp(a->name, "msid")) {
+				m->attributes = g_list_remove(m->attributes, a);
+				janus_sdp_attribute_destroy(a);
+			}
+			la = next;
+		}
+		if(*stored)
+			janus_sdp_attribute_add_to_mline(m, janus_sdp_attribute_create("msid", "%s", *stored));
+		changed = TRUE;
+	}
+	return changed;
 }
 
 
@@ -2683,6 +2777,10 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->media.pre_hold_video_dir = JANUS_SDP_DEFAULT;
 	session->media.video_orientation_extension_id = -1;
 	session->media.audio_level_extension_id = -1;
+	session->media.browser_audio_msid = NULL;
+	session->media.browser_video_msid = NULL;
+	session->media.browser_audio_msid_set = FALSE;
+	session->media.browser_video_msid_set = FALSE;
 	/* Initialize the RTP context */
 	janus_rtp_switching_context_reset(&session->media.acontext);
 	janus_rtp_switching_context_reset(&session->media.vcontext);
@@ -6663,6 +6761,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					if(!has_video_msid)
 						video_ml->direction = JANUS_SDP_RECVONLY;
 				}
+				/* WT-1606: keep the msid presented to the browser stable across
+				 * renegotiations (must run after the recvonly downgrade above, so we
+				 * don't re-inject a video msid for a peer that sends no video) */
+				janus_sip_stabilize_browser_msid(session, sdp);
 				/* Generate a cleaned SDP string (without m=text) for the browser.
 				 * Do NOT fall back to raw pl_data: it isn't bounded to pl_len and would
 				 * leak a pipelined SIP message's bytes to the browser over TCP (WT-1659). */
@@ -7485,6 +7587,8 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					janus_sdp_mline *unhold_video_ml = janus_sdp_mline_find(sdp, JANUS_SDP_VIDEO);
 					if(unhold_video_ml && unhold_video_ml->direction == JANUS_SDP_SENDONLY)
 						unhold_video_ml->direction = JANUS_SDP_SENDRECV;
+					/* WT-1606: keep the msid presented to the browser stable */
+					janus_sip_stabilize_browser_msid(session, sdp);
 					char *unhold_offer_sdp = janus_sdp_write(sdp);
 					json_t *unhold_call = json_object();
 					json_object_set_new(unhold_call, "sip", json_string("event"));
@@ -7553,6 +7657,13 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			gboolean earlymedia_video_still_pending = (!in_progress && session->media.earlymedia &&
 				session->media.local_video_rtp_port > 0 &&
 				pre_sdp_process_remote_video_rtp_port == 0 && session->media.remote_video_rtp_port == 0);
+			/* WT-1606: keep the msid presented to the browser stable across renegotiations
+			 * (capture on the first SDP the caller's browser sees, enforce afterwards).
+			 * If enforcement changed the parsed SDP, serialize it for the browser. */
+			char *stabilized_sdp = NULL;
+			if(janus_sip_stabilize_browser_msid(session, sdp))
+				stabilized_sdp = janus_sdp_write(sdp);
+			char *browser_sdp = stabilized_sdp ? stabilized_sdp : fixed_sdp;
 			json_t *jsep = NULL;
 			if(!session->media.earlymedia) {
 				/* When this is a 183 Early Media response (in_progress) and the SDP contains
@@ -7563,15 +7674,15 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				char *progress_sdp = NULL;
 				gboolean progress_sdp_patched = FALSE;
 				if(in_progress && session->media.local_video_rtp_port > 0) {
-					char *patched = janus_sip_sdp_restore_video_for_earlymedia(fixed_sdp);
-					if(patched && patched != fixed_sdp) {
+					char *patched = janus_sip_sdp_restore_video_for_earlymedia(browser_sdp);
+					if(patched && patched != browser_sdp) {
 						JANUS_LOG(LOG_VERB, "Patched m=video 0 → m=video 9 a=inactive in 183 Early Media SDP "
 							"to keep browser video transceiver alive\n");
 						progress_sdp = patched;
 						progress_sdp_patched = TRUE;
 					}
 				}
-				jsep = json_pack("{ssss}", "type", "answer", "sdp", progress_sdp ? progress_sdp : fixed_sdp);
+				jsep = json_pack("{ssss}", "type", "answer", "sdp", progress_sdp ? progress_sdp : browser_sdp);
 				if(progress_sdp_patched)
 					g_free(progress_sdp);
 			} else {
@@ -7621,7 +7732,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					json_object_set_new(update_result, "call_id", json_string(session->callid));
 				json_object_set_new(update_call, "result", update_result);
 				json_object_set_new(update_call, "call_id", json_string(session->callid));
-				json_t *update_jsep = json_pack("{ssss}", "type", "offer", "sdp", fixed_sdp);
+				json_t *update_jsep = json_pack("{ssss}", "type", "offer", "sdp", browser_sdp);
 				int upd_ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, update_call, update_jsep);
 				JANUS_LOG(LOG_VERB, "  >> Pushing synthetic updatingcall to peer: %d (%s)\n", upd_ret, janus_get_api_error(upd_ret));
 				json_decref(update_call);
@@ -7648,6 +7759,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				/* We just received a 200 OK to an update we sent */
 				session->media.update = FALSE;
 			}
+			g_free(stabilized_sdp);
 			g_free(fixed_sdp);
 			break;
 		}

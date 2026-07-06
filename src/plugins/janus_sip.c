@@ -5330,17 +5330,22 @@ static void *janus_sip_handler(void *data) {
 						}
 					} else {
 						/* PortaSIP RTPproxy bug workaround: when the pre-hold video
-						 * direction was recvonly (e.g. the far end has no camera), Janus
-						 * would offer recvonly in the unhold re-INVITE.  PortaSIP relays
-						 * that recvonly to the other leg, which correctly answers sendonly
-						 * per RFC 3264.  PortaSIP then interprets the sendonly answer as a
-						 * hold-like signal and sets its RTPproxy to no-relay (Nn) mode,
+						 * direction was one-directional (e.g. the far end has no camera),
+						 * Janus would offer that same direction in the unhold re-INVITE.
+						 * PortaSIP relays it to the other leg, which answers the mirror
+						 * direction per RFC 3264, and PortaSIP then interprets that answer
+						 * as a hold-like signal and sets its RTPproxy to no-relay (Nn) mode,
 						 * permanently blocking video from the sender to this leg.
 						 * Offering sendrecv instead prevents PortaSIP from entering the
 						 * broken no-relay state while still resulting in a one-directional
 						 * video flow in practice (the sender answers sendrecv, the receiver
-						 * has no camera so sends nothing). */
-						m->direction = (session->media.pre_hold_video_dir == JANUS_SDP_RECVONLY)
+						 * has no camera so sends nothing).
+						 * WT-1656: also cover pre-hold sendonly. After the no-msid recvonly
+						 * downgrade of the unhold updatingcall, a camera-equipped browser
+						 * answers sendonly, so session->sdp now carries sendonly video and a
+						 * subsequent hold/unhold would otherwise re-trigger the RTPproxy bug. */
+						m->direction = (session->media.pre_hold_video_dir == JANUS_SDP_RECVONLY ||
+								session->media.pre_hold_video_dir == JANUS_SDP_SENDONLY)
 							? JANUS_SDP_SENDRECV : session->media.pre_hold_video_dir;
 					}
 				}
@@ -7621,15 +7626,35 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 						session->media.remote_video_rtcp_port);
 					session->media.unhold_video_recovery = TRUE;
 					janus_sip_call_update_status(session, janus_sip_call_status_incall_reinvited);
-					/* Use sendrecv for video in the synthetic offer: when PortaSIP answers
-					 * with a=sendonly (it only sends, B has no camera), the browser fails to
-					 * resume rendering the frozen track after renegotiation. Forcing sendrecv
-					 * mimics a normal re-INVITE and causes the browser to correctly unfreeze.
-					 * B's answer will still be a=recvonly since restoreTransceiverDirections()
-					 * in the Dialer preserves recvonly when there is no local video sender. */
+					/* WT-1656: mirror the incoming re-INVITE guard (nua_i_invite path, WT-1606).
+					 * When the resume 200 OK's video m-line has no a=msid (the peer sends no
+					 * video, e.g. it has no camera), a sendrecv/sendonly video m-line with no
+					 * SSRC/msid makes Chrome build a catch-all SSRC bucket that absorbs the
+					 * bundled audio and silences it after unhold. Downgrade to recvonly so the
+					 * browser answers sendonly and keeps the bundled audio.
+					 * Only when a real video msid is present do we keep the sendonly->sendrecv
+					 * upgrade: forcing sendrecv there makes the browser resume rendering the
+					 * frozen track after renegotiation (WT-1267 unhold video unfreeze). */
 					janus_sdp_mline *unhold_video_ml = janus_sdp_mline_find(sdp, JANUS_SDP_VIDEO);
-					if(unhold_video_ml && unhold_video_ml->direction == JANUS_SDP_SENDONLY)
-						unhold_video_ml->direction = JANUS_SDP_SENDRECV;
+					if(unhold_video_ml && unhold_video_ml->port > 0 &&
+							(unhold_video_ml->direction == JANUS_SDP_SENDRECV ||
+							unhold_video_ml->direction == JANUS_SDP_SENDONLY ||
+							unhold_video_ml->direction == JANUS_SDP_DEFAULT)) {
+						gboolean has_video_msid = FALSE;
+						GList *la = unhold_video_ml->attributes;
+						while(la) {
+							janus_sdp_attribute *a = (janus_sdp_attribute *)la->data;
+							if(a->name && !strcasecmp(a->name, "msid")) {
+								has_video_msid = TRUE;
+								break;
+							}
+							la = la->next;
+						}
+						if(!has_video_msid)
+							unhold_video_ml->direction = JANUS_SDP_RECVONLY;
+						else if(unhold_video_ml->direction == JANUS_SDP_SENDONLY)
+							unhold_video_ml->direction = JANUS_SDP_SENDRECV;
+					}
 					/* WT-1606: keep the msid presented to the browser stable */
 					janus_sip_stabilize_browser_msid(session, sdp);
 					char *unhold_offer_sdp = janus_sdp_write(sdp);

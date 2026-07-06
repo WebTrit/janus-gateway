@@ -1318,6 +1318,11 @@ typedef struct janus_sip_media {
 	 * when it is "no msid" (the core then synthesizes a stable default) (WT-1606) */
 	char *browser_audio_msid, *browser_video_msid;
 	gboolean browser_audio_msid_set, browser_video_msid_set;
+	/* TRUE when the last browser-facing offer's video m-line was downgraded
+	 * sendrecv->recvonly (peer offered video with no msid, i.e. sends none); the
+	 * browser then answers sendonly, which PortaSIP's b2bua mistakes for a video
+	 * hold and parks the relay — so the SIP-side answer must say sendrecv (WT-1606) */
+	gboolean video_offer_downgraded;
 } janus_sip_media;
 
 typedef struct janus_sip_dtmf {
@@ -1850,6 +1855,7 @@ static void janus_sip_media_reset(janus_sip_session *session) {
 	session->media.browser_video_msid = NULL;
 	session->media.browser_audio_msid_set = FALSE;
 	session->media.browser_video_msid_set = FALSE;
+	session->media.video_offer_downgraded = FALSE;
 	janus_rtp_switching_context_reset(&session->media.acontext);
 	janus_rtp_switching_context_reset(&session->media.vcontext);
 	/* Free any stored text m-lines from a previous call */
@@ -1946,6 +1952,25 @@ static gboolean janus_sip_stabilize_browser_msid(janus_sip_session *session, jan
 	return changed;
 }
 
+/* WT-1606: when the peer's video offer was downgraded sendrecv->recvonly towards
+ * the browser (no msid, peer sends no video), the browser truthfully answers
+ * sendonly. PortaSIP's b2bua treats a sendonly video answer as a hold and parks
+ * the relay (rtpproxy set_stream flags=N) — our outgoing video then never reaches
+ * the party that IS watching it. Present sendrecv on the SIP side instead: the
+ * peer sends no video anyway, so the receive direction is vacuous, and the b2bua
+ * keeps relaying. Only fires when the downgrade actually happened, so answers to
+ * a real hold offer (peer sendonly -> browser recvonly) are never touched. */
+static void janus_sip_restore_video_direction_for_peer(janus_sip_session *session, janus_sdp *sdp) {
+	if(session == NULL || sdp == NULL || !session->media.video_offer_downgraded)
+		return;
+	janus_sdp_mline *m = janus_sdp_mline_find(sdp, JANUS_SDP_VIDEO);
+	if(m == NULL || m->port == 0 || m->direction != JANUS_SDP_SENDONLY)
+		return;
+	JANUS_LOG(LOG_INFO, "[SIP-%s] Restoring video direction sendonly -> sendrecv in SIP answer "
+		"(browser-facing offer was downgraded to recvonly)\n",
+		session->account.username ? session->account.username : "??");
+	m->direction = JANUS_SDP_SENDRECV;
+}
 
 /* Sofia Event thread */
 gpointer janus_sip_sofia_thread(gpointer user_data);
@@ -2781,6 +2806,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->media.browser_video_msid = NULL;
 	session->media.browser_audio_msid_set = FALSE;
 	session->media.browser_video_msid_set = FALSE;
+	session->media.video_offer_downgraded = FALSE;
 	/* Initialize the RTP context */
 	janus_rtp_switching_context_reset(&session->media.acontext);
 	janus_rtp_switching_context_reset(&session->media.vcontext);
@@ -4674,6 +4700,8 @@ static void *janus_sip_handler(void *data) {
 				g_list_free(session->text_mlines);
 				session->text_mlines = NULL;
 			}
+			/* WT-1606: undo the browser-facing recvonly downgrade in the SIP-side answer */
+			janus_sip_restore_video_direction_for_peer(session, parsed_sdp);
 			char *sdp = janus_sip_sdp_manipulate(session, parsed_sdp, TRUE);
 			if(sdp == NULL) {
 				JANUS_LOG(LOG_ERR, "Could not allocate RTP/RTCP ports\n");
@@ -4894,6 +4922,10 @@ static void *janus_sip_handler(void *data) {
 					}
 				}
 			}
+			/* WT-1606: when answering a re-INVITE whose video offer we downgraded for the
+			 * browser, undo the resulting sendonly in the SIP-side answer */
+			if(!offer)
+				janus_sip_restore_video_direction_for_peer(session, parsed_sdp);
 			char *sdp = janus_sip_sdp_manipulate(session, parsed_sdp, !offer);
 			if(sdp == NULL) {
 				JANUS_LOG(LOG_ERR, "Error manipulating SDP\n");
@@ -6758,8 +6790,19 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 						}
 						la = la->next;
 					}
-					if(!has_video_msid)
+					if(!has_video_msid) {
 						video_ml->direction = JANUS_SDP_RECVONLY;
+						/* Remember the downgrade: the browser will answer sendonly, and the
+						 * SIP-side answer must be restored to sendrecv (see
+						 * janus_sip_restore_video_direction_for_peer) */
+						session->media.video_offer_downgraded = TRUE;
+					} else {
+						session->media.video_offer_downgraded = FALSE;
+					}
+				} else if(video_ml) {
+					/* Peer explicitly set a non-sendrecv direction (e.g. a real hold):
+					 * not our downgrade, answers must be relayed as-is */
+					session->media.video_offer_downgraded = FALSE;
 				}
 				/* WT-1606: keep the msid presented to the browser stable across
 				 * renegotiations (must run after the recvonly downgrade above, so we

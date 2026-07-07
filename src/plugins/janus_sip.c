@@ -9416,7 +9416,17 @@ gpointer janus_sip_sofia_thread(gpointer user_data) {
 		g_snprintf(sip_url, sizeof(sip_url), "sip:%s%s%s:*;transport=udp", ipv6 ? "[" : "", local_ip, ipv6 ? "]" : "");
 	g_snprintf(sips_url, sizeof(sips_url), "sips:%s%s%s:*;transport=tls", ipv6 ? "[" : "", local_ip, ipv6 ? "]" : "");
 	char outbound_options[256] = "use-rport no-validate";
-	if(keepalive_interval > 0)
+	/* WT-1630: OPTIONS keepalives are only requested for datagram transports.
+	 * On TCP/TLS the ephemeral source port changes on every reconnect; Sofia's
+	 * outbound module treats the changed rport echoed in the OPTIONS response
+	 * as a NAT binding change (skipping the natify check) and re-REGISTERs with
+	 * an ever-growing Contact chain. Connection liveness on TCP/TLS is covered
+	 * by the RFC 5626 CRLF ping/pong (TPTAG_KEEPALIVE/TPTAG_PINGPONG below),
+	 * and a closed registration connection already triggers an immediate
+	 * re-REGISTER inside Sofia. The explicit flag must stay for UDP: with
+	 * no-natify Sofia never populates ob_via, so its own UDP-only keepalive
+	 * default never engages. */
+	if(keepalive_interval > 0 && !session->account.force_tcp && !session->account.sips)
 		janus_strlcat(outbound_options, " options-keepalive", sizeof(outbound_options));
 	if(!behind_nat)
 		janus_strlcat(outbound_options, " no-natify", sizeof(outbound_options));

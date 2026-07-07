@@ -13,7 +13,10 @@ general: {
 
 	# Enable local keep-alives to keep the registration open. Keep-alives are
 	# sent in the form of OPTIONS requests, at the given interval inseconds.
-	# (0 to disable)
+	# (0 to disable). Only applies to UDP registrations: on TCP/TLS the
+	# connection itself keeps the binding alive (see tcp_keepalive_interval),
+	# and OPTIONS keepalives would make Sofia's outbound module accumulate
+	# Contact headers on every reconnect (WT-1630).
 	keepalive_interval = 120
 
 	# Indicate if the server is behind NAT. If so, the server will use STUN

@@ -1583,7 +1583,7 @@ int janus_process_incoming_request(janus_request *request) {
 					}
 				}
 				/* Process the remote SDP */
-				if(janus_sdp_process_remote(handle, parsed_sdp, rids_hml, FALSE) < 0) {
+				if(janus_sdp_process_remote(handle, parsed_sdp, rids_hml, FALSE, offer) < 0) {
 					JANUS_LOG(LOG_ERR, "Error processing SDP\n");
 					janus_sdp_destroy(parsed_sdp);
 					g_free(jsep_type);
@@ -1679,7 +1679,7 @@ int janus_process_incoming_request(janus_request *request) {
 				/* FIXME This is a renegotiation: we can currently only handle simple changes in media
 				 * direction and ICE restarts: anything more complex than that will result in an error */
 				JANUS_LOG(LOG_INFO, "[%"SCNu64"] Negotiation update, checking what changed...\n", handle->handle_id);
-				if(janus_sdp_process_remote(handle, parsed_sdp, rids_hml, TRUE) < 0) {
+				if(janus_sdp_process_remote(handle, parsed_sdp, rids_hml, TRUE, offer) < 0) {
 					JANUS_LOG(LOG_ERR, "Error processing SDP\n");
 					janus_sdp_destroy(parsed_sdp);
 					g_free(jsep_type);

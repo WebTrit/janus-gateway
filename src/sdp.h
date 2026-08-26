@@ -54,8 +54,9 @@ janus_sdp *janus_sdp_preparse(void *handle, const char *jsep_sdp, char *error_st
  * @param[in] sdp The Janus SDP object to process
  * @param[in] rids_hml Whether the order of rids in the SDP, if present, will be h-m-l (TRUE) or l-m-h (FALSE)
  * @param[in] update Whether this SDP is an update to an existing session or not
+ * @param[in] offer Whether this session description is an offer (TRUE) or an answer (FALSE)
  * @returns 0 in case of success, -1 in case of an error */
-int janus_sdp_process_remote(void *handle, janus_sdp *sdp, gboolean rids_hml, gboolean update);
+int janus_sdp_process_remote(void *handle, janus_sdp *sdp, gboolean rids_hml, gboolean update, gboolean offer);
 
 /*! \brief Method to process a local parsed session description
  * \details This method will process a session description coming from a plugin, and set up the ICE candidates accordingly

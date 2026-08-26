@@ -143,7 +143,7 @@ janus_sdp *janus_sdp_preparse(void *ice_handle, const char *jsep_sdp, char *erro
 }
 
 /* Parse remote SDP */
-int janus_sdp_process_remote(void *ice_handle, janus_sdp *remote_sdp, gboolean rids_hml, gboolean update) {
+int janus_sdp_process_remote(void *ice_handle, janus_sdp *remote_sdp, gboolean rids_hml, gboolean update, gboolean offer) {
 	if(!ice_handle || !remote_sdp)
 		return -1;
 	janus_ice_handle *handle = (janus_ice_handle *)ice_handle;
@@ -186,6 +186,7 @@ int janus_sdp_process_remote(void *ice_handle, janus_sdp *remote_sdp, gboolean r
 	temp = remote_sdp->m_lines;
 	while(temp) {
 		janus_sdp_mline *m = (janus_sdp_mline *)temp->data;
+		gboolean was_rejected = FALSE;
 		if(m->type == JANUS_SDP_AUDIO || m->type == JANUS_SDP_VIDEO) {
 			/* Audio/Video */
 			if(handle->rtp_profile == NULL && m->proto != NULL)
@@ -197,6 +198,11 @@ int janus_sdp_process_remote(void *ice_handle, janus_sdp *remote_sdp, gboolean r
 				medium = janus_ice_peerconnection_medium_create(handle,
 					m->type == JANUS_SDP_VIDEO ? JANUS_MEDIA_VIDEO : JANUS_MEDIA_AUDIO);
 			}
+			/* Was this m-line rejected in the previous negotiation? Take note before we
+			 * update the state below: if the peer is now recycling the slot, it will come
+			 * with a new mid, and we'll have to honour it (see the mid handling later) */
+			was_rejected = medium->rejected;
+			medium->rejected = (m->port == 0);
 			if(m->port > 0) {
 				JANUS_LOG(LOG_VERB, "[%"SCNu64"] Parsing m-line #%d...\n", handle->handle_id, m->index);
 				gboolean receiving = (medium->recv == TRUE);
@@ -234,6 +240,35 @@ int janus_sdp_process_remote(void *ice_handle, janus_sdp *remote_sdp, gboolean r
 					while(temp) {
 						g_hash_table_insert(pc->payload_types, temp->data, temp->data);
 						temp = temp->next;
+					}
+				}
+				/* If this m-line was inactive, our local SSRC was reset (see
+				 * janus_sdp_process_local): now that it's active again we need a new one.
+				 * We can't rely on janus_sdp_process_local doing it, since the core only
+				 * invokes it for offers coming from the plugin, not for answers: without
+				 * this, an m-line revived by a plugin answer would be advertised with no
+				 * a=ssrc at all (and a=ssrc-group:FID 0 ...), and we'd relay RTP to the
+				 * peer with SSRC 0 (WT-1850) */
+				if(medium->ssrc == 0 && m->direction != JANUS_SDP_INACTIVE) {
+					medium->ssrc = janus_random_uint32();	/* FIXME Should we look for conflicts? */
+					if(medium->ssrc_rtx == 0) {
+						/* Create an SSRC for RFC4588 as well: we can't check the
+						 * JANUS_ICE_HANDLE_WEBRTC_RFC4588_RTX flag here, since it's only
+						 * updated for this SDP further below, but that's fine: if rtx turns
+						 * out not to be negotiated, the check at the end of this method
+						 * gets rid of this SSRC again */
+						medium->ssrc_rtx = janus_random_uint32();	/* FIXME Should we look for conflicts? */
+					}
+					JANUS_LOG(LOG_VERB, "[%"SCNu64"] Regenerated local SSRC for m-line #%d: %"SCNu32" (rtx %"SCNu32")\n",
+						handle->handle_id, m->index, medium->ssrc, medium->ssrc_rtx);
+					if(!g_hash_table_lookup(pc->media_byssrc, GINT_TO_POINTER(medium->ssrc))) {
+						g_hash_table_insert(pc->media_byssrc, GINT_TO_POINTER(medium->ssrc), medium);
+						janus_refcount_increase(&medium->ref);
+					}
+					if(medium->ssrc_rtx > 0 &&
+							!g_hash_table_lookup(pc->media_byssrc, GINT_TO_POINTER(medium->ssrc_rtx))) {
+						g_hash_table_insert(pc->media_byssrc, GINT_TO_POINTER(medium->ssrc_rtx), medium);
+						janus_refcount_increase(&medium->ref);
 					}
 				}
 			} else {
@@ -311,8 +346,32 @@ int janus_sdp_process_remote(void *ice_handle, janus_sdp *remote_sdp, gboolean r
 						return -2;
 					}
 					if(medium->mid != NULL && strcasecmp(medium->mid, a->value)) {
-						JANUS_LOG(LOG_WARN, "[%"SCNu64"] mid on m-line #%d changed (%s --> %s), ignoring new value\n",
-							handle->handle_id, m->index, medium->mid, a->value);
+						/* JSEP only allows the mid of an m-line to change when the peer is
+						 * recycling an m-section that was rejected before (e.g. Chrome
+						 * stopping a transceiver and adding a track back later): in that
+						 * case the offer is authoritative and our answer must use the new
+						 * mid, or the peer will refuse it (WT-1850). Any other mid change
+						 * is a peer error, and is ignored as before. */
+						if(offer && was_rejected && !g_hash_table_lookup(pc->media_bymid, a->value)) {
+							JANUS_LOG(LOG_INFO, "[%"SCNu64"] m-line #%d recycled by the peer, mid changed (%s --> %s)\n",
+								handle->handle_id, m->index, medium->mid, a->value);
+							char *old_mid = medium->mid;
+							medium->mid = g_strdup(a->value);
+							g_hash_table_insert(pc->media_bymid, g_strdup(medium->mid), medium);
+							janus_refcount_increase(&medium->ref);
+							/* Get rid of the mapping for the mid we just replaced, but only
+							 * if it's actually ours (a peer sending duplicate mids may have
+							 * left it pointing at another medium) */
+							if(g_hash_table_lookup(pc->media_bymid, old_mid) == medium)
+								g_hash_table_remove(pc->media_bymid, old_mid);
+							/* Keep the old string around: the RTP thread reads medium->mid
+							 * without holding the handle mutex, so freeing it here would be
+							 * a use-after-free. It's released with the medium instead. */
+							medium->old_mids = g_slist_prepend(medium->old_mids, old_mid);
+						} else {
+							JANUS_LOG(LOG_WARN, "[%"SCNu64"] mid on m-line #%d changed (%s --> %s), ignoring new value\n",
+								handle->handle_id, m->index, medium->mid, a->value);
+						}
 					} else if(medium->mid == NULL) {
 						medium->mid = g_strdup(a->value);
 						if(!g_hash_table_lookup(pc->media_bymid, medium->mid)) {

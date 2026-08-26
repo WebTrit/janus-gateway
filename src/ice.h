@@ -554,6 +554,10 @@ struct janus_ice_peerconnection_medium {
 	int mindex;
 	/*! \brief Media ID */
 	char *mid;
+	/*! \brief Previous Media IDs, in case the peer recycled this m-line: we can't free
+	 * them right away, since the RTP thread reads mid without holding the handle mutex,
+	 * so we keep them around until the medium itself goes away (WT-1850) */
+	GSList *old_mids;
 	/*! \brief Media Stream ID info */
 	char *msid, *mstid, *remote_msid, *remote_mstid;
 	/*! \brief SSRC of the server for this medium */
@@ -590,6 +594,9 @@ struct janus_ice_peerconnection_medium {
 	gboolean (* video_is_keyframe)(const char* buffer, int len);
 	/*! \brief Media direction */
 	gboolean send, recv;
+	/*! \brief Whether this audio/video m-line was rejected (port 0) in the last remote
+	 * SDP: the peer may recycle the slot with a new mid in a subsequent offer (WT-1850) */
+	gboolean rejected;
 	/*! \brief RTCP context(s) for the medium (may be simulcasting) */
 	janus_rtcp_context *rtcp_ctx[3];
 	/*! \brief Size of the NACK queue (in ms), dynamically updated per the RTT */

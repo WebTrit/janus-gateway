@@ -1323,6 +1323,24 @@ typedef struct janus_sip_media {
 	 * browser then answers sendonly, which PortaSIP's b2bua mistakes for a video
 	 * hold and parks the relay — so the SIP-side answer must say sendrecv (WT-1606) */
 	gboolean video_offer_downgraded;
+	/* Conference bridge mode (WT-783): while active, the audio the SIP peer
+	 * receives comes from an external mixer (the AudioBridge plugin) over plain
+	 * RTP on loopback, instead of from the browser's PeerConnection.  The other
+	 * direction is already covered by the existing "peer_audio" RTP forwarders,
+	 * so only the inbound half lives here.  The PeerConnection is deliberately
+	 * left up: tearing it down would make janus_sip_hangup_media_internal() send
+	 * a BYE and kill the very call we are conferencing. */
+	int bridge_fd;					/* Socket the mixer sends the mix to */
+	int bridge_port;				/* Local port of that socket */
+	volatile gint bridge_active;
+	/* The mixer has its own SSRC/seq/ts numbering; the SIP peer must keep seeing
+	 * the single continuous stream it has been getting all along, so packets are
+	 * restamped onto audio_ssrc with our own counters. */
+	gboolean bridge_ts_inited;
+	guint32 bridge_last_in_ts;
+	guint32 bridge_out_ts;
+	guint16 bridge_out_seq;
+	guint32 bridge_in_packets;		/* Injected into the SIP leg, for diagnostics */
 } janus_sip_media;
 
 typedef struct janus_sip_dtmf {
@@ -1986,6 +2004,11 @@ static int janus_sip_allocate_local_ports(janus_sip_session *session, gboolean u
 static void *janus_sip_relay_thread(void *data);
 static void janus_sip_media_cleanup(janus_sip_session *session);
 static void janus_sip_check_rfc2833(janus_sip_session *session, char *buffer, int len);
+/* Conference bridge mode (WT-783) */
+static int janus_sip_bridge_open(janus_sip_session *session);
+static void janus_sip_bridge_close(janus_sip_session *session);
+static void janus_sip_bridge_poke(janus_sip_session *session);
+static void janus_sip_bridge_relay_to_peer(janus_sip_session *session, char *buffer, int bytes);
 
 /* URI parsing utilities */
 
@@ -2768,6 +2791,14 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->media.video_srtp_local_profile = NULL;
 	session->media.video_srtp_local_crypto = NULL;
 	session->media.on_hold = FALSE;
+	session->media.bridge_fd = -1;
+	session->media.bridge_port = 0;
+	g_atomic_int_set(&session->media.bridge_active, 0);
+	session->media.bridge_ts_inited = FALSE;
+	session->media.bridge_last_in_ts = 0;
+	session->media.bridge_out_ts = 0;
+	session->media.bridge_out_seq = 0;
+	session->media.bridge_in_packets = 0;
 	session->media.has_audio = FALSE;
 	session->media.audio_rtp_fd = -1;
 	session->media.audio_rtcp_fd= -1;
@@ -3159,12 +3190,26 @@ void janus_sip_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *pack
 				/* Dropping audio packet, the call is on hold and we're not sending anything */
 				return;
 			}
+			if(g_atomic_int_get(&session->media.bridge_active)) {
+				/* Conference bridge mode: the peer's audio comes from the mixer, not
+				 * from this PeerConnection.  Relaying both would double the talker
+				 * (WT-783) */
+				return;
+			}
 			if(session->media.audio_ssrc == 0) {
 				janus_rtp_header *header = (janus_rtp_header *)buf;
 				session->media.audio_ssrc = ntohl(header->ssrc);
 				JANUS_LOG(LOG_VERB, "Got SIP audio SSRC: %"SCNu32"\n", session->media.audio_ssrc);
 			}
 			if(session->media.has_audio && session->media.audio_rtp_fd != -1) {
+				/* Track what the peer last received, so if this call is later merged
+				 * into a conference the mix can continue the same numbering instead
+				 * of restarting it - same SSRC with a discontinuous sequence makes a
+				 * receiver treat it as a restart and drop packets until it resynchs
+				 * (RFC 3550 A.1) (WT-783) */
+				janus_rtp_header *ahdr = (janus_rtp_header *)buf;
+				session->media.bridge_out_seq = ntohs(ahdr->seq_number);
+				session->media.bridge_out_ts = ntohl(ahdr->timestamp);
 				/* Check if there are forwarders interested in this traffic */
 				janus_mutex_lock(&session->rtp_forwarders_mutex);
 				GHashTableIter iter;
@@ -3357,6 +3402,8 @@ static void janus_sip_hangup_media_internal(janus_plugin_session *handle) {
 	janus_mutex_lock(&session->rec_mutex);
 	janus_sip_recorder_close(session, TRUE, TRUE, TRUE, TRUE);
 	janus_mutex_unlock(&session->rec_mutex);
+	/* Leave conference bridge mode, if we were in it (WT-783) */
+	janus_sip_bridge_close(session);
 	/* Get rid of RTP forwarders, if any */
 	janus_mutex_lock(&session->rtp_forwarders_mutex);
 	g_hash_table_remove_all(session->audio_forwarders);
@@ -6185,6 +6232,47 @@ static void *janus_sip_handler(void *data) {
 			if(new_forwarders != NULL)
 				json_object_set_new(result, "forwarders", new_forwarders);
 			json_object_set_new(result, "event", json_string("rtp_forward"));
+		} else if(!strcasecmp(request_text, "bridge_in")) {
+			/* Conference bridge mode (WT-783): open a loopback socket an external
+			 * mixer can send the conference mix to, and start injecting whatever
+			 * arrives on it into the SIP leg.  The opposite direction is set up by
+			 * the application with a plain "rtp_forward" of type "peer_audio".
+			 * Requires an established call: without one there is no leg to inject
+			 * into and no SSRC to restamp onto. */
+			if(!janus_sip_call_is_established(session)) {
+				JANUS_LOG(LOG_ERR, "Wrong state (no active call?)\n");
+				error_code = JANUS_SIP_ERROR_WRONG_STATE;
+				g_snprintf(error_cause, 512, "Wrong state (no active call?)");
+				goto error;
+			}
+			janus_mutex_lock(&session->mutex);
+			int bridge_port = janus_sip_bridge_open(session);
+			janus_mutex_unlock(&session->mutex);
+			if(bridge_port < 0) {
+				JANUS_LOG(LOG_ERR, "Could not open the conference bridge socket\n");
+				error_code = JANUS_SIP_ERROR_IO_ERROR;
+				g_snprintf(error_cause, 512, "Could not open the conference bridge socket");
+				goto error;
+			}
+			janus_sip_bridge_poke(session);
+			result = json_object();
+			json_object_set_new(result, "event", json_string("bridge_in"));
+			json_object_set_new(result, "port", json_integer(bridge_port));
+			/* Report what this leg negotiated, so the application can join the
+			 * mixer with a matching codec: a mix encoded as PCMU but stamped with
+			 * a PCMA payload type decodes to noise at the far end. */
+			if(session->media.audio_pt != -1)
+				json_object_set_new(result, "pt", json_integer(session->media.audio_pt));
+			if(session->media.audio_pt_name != NULL)
+				json_object_set_new(result, "codec", json_string(session->media.audio_pt_name));
+		} else if(!strcasecmp(request_text, "bridge_stop")) {
+			/* Leave conference mode: the browser's audio reaches the peer again */
+			janus_mutex_lock(&session->mutex);
+			janus_sip_bridge_close(session);
+			janus_mutex_unlock(&session->mutex);
+			janus_sip_bridge_poke(session);
+			result = json_object();
+			json_object_set_new(result, "event", json_string("bridge_stop"));
 		} else if(!strcasecmp(request_text, "stop_rtp_forward")) {
 			JANUS_VALIDATE_JSON_OBJECT(root, stop_rtp_forward_parameters,
 				error_code, error_cause, TRUE,
@@ -8879,7 +8967,142 @@ static void janus_sip_connect_sockets(janus_sip_session *session, struct sockadd
 	}
 }
 
+/* Conference bridge mode (WT-783) --------------------------------------------
+ *
+ * Open the socket the external mixer sends the mix to.  The port is ephemeral
+ * and handed back to the application, which passes it to the mixer.
+ *
+ * The socket is bound to INADDR_ANY on purpose.  The mixer (the AudioBridge
+ * plugin, same process) binds its own plain-RTP sockets to Janus's media IP,
+ * and a socket bound there cannot send to 127.0.0.1 - the kernel has no route
+ * from a LAN source address to loopback and answers with ICMP port unreachable,
+ * which AudioBridge reports as "Connection refused" and then tears the
+ * participant thread down.  Binding to any address keeps the two ends
+ * reachable whichever IP Janus ended up with. */
+static int janus_sip_bridge_open(janus_sip_session *session) {
+	if(session == NULL)
+		return -1;
+	if(session->media.bridge_fd != -1)
+		return session->media.bridge_port;	/* Already open */
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if(fd == -1) {
+		JANUS_LOG(LOG_ERR, "[SIP-%s] Error creating bridge socket: %s\n",
+			session->account.username, g_strerror(errno));
+		return -1;
+	}
+	struct sockaddr_in addr = { 0 };
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	addr.sin_port = 0;	/* Let the kernel pick */
+	if(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		JANUS_LOG(LOG_ERR, "[SIP-%s] Error binding bridge socket: %s\n",
+			session->account.username, g_strerror(errno));
+		close(fd);
+		return -1;
+	}
+	socklen_t alen = sizeof(addr);
+	if(getsockname(fd, (struct sockaddr *)&addr, &alen) < 0) {
+		JANUS_LOG(LOG_ERR, "[SIP-%s] Error reading bridge socket port: %s\n",
+			session->account.username, g_strerror(errno));
+		close(fd);
+		return -1;
+	}
+	session->media.bridge_fd = fd;
+	session->media.bridge_port = ntohs(addr.sin_port);
+	session->media.bridge_ts_inited = FALSE;
+	g_atomic_int_set(&session->media.bridge_active, 1);
+	JANUS_LOG(LOG_INFO, "[SIP-%s] Conference bridge listening on port %d\n",
+		session->account.username, session->media.bridge_port);
+	return session->media.bridge_port;
+}
+
+static void janus_sip_bridge_close(janus_sip_session *session) {
+	if(session == NULL)
+		return;
+	g_atomic_int_set(&session->media.bridge_active, 0);
+	if(session->media.bridge_fd != -1) {
+		close(session->media.bridge_fd);
+		session->media.bridge_fd = -1;
+	}
+	if(session->media.bridge_in_packets > 0) {
+		JANUS_LOG(LOG_INFO, "[SIP-%s] conference bridge closed after %"SCNu32" injected packets\n",
+			session->account.username, session->media.bridge_in_packets);
+	}
+	session->media.bridge_port = 0;
+	session->media.bridge_ts_inited = FALSE;
+	session->media.bridge_in_packets = 0;
+}
+
+/* Wake the relay thread so it rebuilds its poll set with (or without) the
+ * bridge socket.  Same mechanism media updates already use. */
+static void janus_sip_bridge_poke(janus_sip_session *session) {
+	if(session == NULL || session->media.pipefd[1] == -1)
+		return;
+	int code = 1;
+	if(write(session->media.pipefd[1], &code, sizeof(int)) < 0) {
+		JANUS_LOG(LOG_HUGE, "[SIP-%s] Error poking relay thread: %s\n",
+			session->account.username, g_strerror(errno));
+	}
+}
+
+/* Restamp one packet coming from the mixer onto the stream the SIP peer is
+ * already receiving, and send it out on the SIP leg. */
+static void janus_sip_bridge_relay_to_peer(janus_sip_session *session, char *buffer, int bytes) {
+	if(session == NULL || bytes < 12 || session->media.audio_rtp_fd == -1)
+		return;
+	if(!session->media.audio_send)
+		return;
+	if(session->media.on_hold && session->media.hold_audio_dir != JANUS_SDP_SENDONLY)
+		return;
+	janus_rtp_header *header = (janus_rtp_header *)buffer;
+	guint32 in_ts = ntohl(header->timestamp);
+	if(!session->media.bridge_ts_inited) {
+		session->media.bridge_ts_inited = TRUE;
+		session->media.bridge_last_in_ts = in_ts;
+		/* bridge_out_seq/ts already hold what the peer last received from the
+		 * browser, so the stream simply continues from there */
+	} else {
+		/* Advance by the mixer's own delta: codec/packetization agnostic */
+		session->media.bridge_out_ts += (in_ts - session->media.bridge_last_in_ts);
+		session->media.bridge_last_in_ts = in_ts;
+	}
+	session->media.bridge_out_seq++;
+	session->media.bridge_in_packets++;
+	if(session->media.bridge_in_packets == 1) {
+		JANUS_LOG(LOG_INFO, "[SIP-%s] conference bridge: first packet from the mixer injected into the SIP leg\n",
+			session->account.username);
+	}
+	header->ssrc = htonl(session->media.audio_ssrc);
+	header->timestamp = htonl(session->media.bridge_out_ts);
+	header->seq_number = htons(session->media.bridge_out_seq);
+	if(session->media.audio_pt != -1)
+		header->type = session->media.audio_pt;
+	if(session->media.has_srtp_local_audio) {
+		char sbuf[2048];
+		if(bytes > (int)sizeof(sbuf))
+			return;
+		memcpy(&sbuf, buffer, bytes);
+		int protected = bytes;
+		int res = srtp_protect(session->media.audio_srtp_out, &sbuf, &protected);
+		if(res != srtp_err_status_ok) {
+			JANUS_LOG(LOG_ERR, "[SIP-%s] Bridge audio SRTP protect error... %s (len=%d-->%d)\n",
+				session->account.username, janus_srtp_error_str(res), bytes, protected);
+			return;
+		}
+		if(send(session->media.audio_rtp_fd, sbuf, protected, 0) < 0) {
+			JANUS_LOG(LOG_HUGE, "[SIP-%s] Error sending bridged SRTP audio packet... %s\n",
+				session->account.username, g_strerror(errno));
+		}
+	} else {
+		if(send(session->media.audio_rtp_fd, buffer, bytes, 0) < 0) {
+			JANUS_LOG(LOG_HUGE, "[SIP-%s] Error sending bridged RTP audio packet... %s\n",
+				session->account.username, g_strerror(errno));
+		}
+	}
+}
+
 static void janus_sip_media_cleanup(janus_sip_session *session) {
+	janus_sip_bridge_close(session);
 	if(session->media.audio_rtp_fd != -1) {
 		close(session->media.audio_rtp_fd);
 		session->media.audio_rtp_fd = -1;
@@ -8948,7 +9171,7 @@ static void *janus_sip_relay_thread(void *data) {
 	socklen_t addrlen;
 	struct sockaddr_in remote;
 	int resfd = 0, bytes = 0, pollerrs = 0;
-	struct pollfd fds[5];
+	struct pollfd fds[6];	/* +1 for the conference bridge socket (WT-783) */
 	int pipe_fd = session->media.pipefd[0];
 	char buffer[1500];
 	memset(buffer, 0, 1500);
@@ -9091,6 +9314,13 @@ static void *janus_sip_relay_thread(void *data) {
 			fds[num].revents = 0;
 			num++;
 		}
+		/* Conference bridge: the mix coming back from the external mixer (WT-783) */
+		if(g_atomic_int_get(&session->media.bridge_active) && session->media.bridge_fd != -1) {
+			fds[num].fd = session->media.bridge_fd;
+			fds[num].events = POLLIN;
+			fds[num].revents = 0;
+			num++;
+		}
 		/* Finally, let's add the pipe */
 		pipe_fd = session->media.pipefd[0];
 		if(pipe_fd == -1) {
@@ -9164,6 +9394,16 @@ static void *janus_sip_relay_thread(void *data) {
 					int code = 0;
 					(void)read(pipe_fd, &code, sizeof(int));
 					break;
+				}
+				/* Mix coming back from the external mixer? (WT-783) */
+				if(session->media.bridge_fd != -1 && fds[i].fd == session->media.bridge_fd) {
+					addrlen = sizeof(remote);
+					bytes = recvfrom(session->media.bridge_fd, buffer, 1500, 0, (struct sockaddr*)&remote, &addrlen);
+					if(bytes < 0 || !janus_is_rtp(buffer, bytes))
+						continue;
+					pollerrs = 0;
+					janus_sip_bridge_relay_to_peer(session, buffer, bytes);
+					continue;
 				}
 				/* Got an RTP/RTCP packet */
 				if(session->media.audio_rtp_fd != -1 && fds[i].fd == session->media.audio_rtp_fd) {

@@ -6281,6 +6281,9 @@ static void *janus_sip_handler(void *data) {
 				json_object_set_new(result, "pt", json_integer(session->media.audio_pt));
 			if(session->media.audio_pt_name != NULL)
 				json_object_set_new(result, "codec", json_string(session->media.audio_pt_name));
+			/* The mixer is audio only, so the application needs to know whether this
+			 * leg negotiated video before it decides to conference it. */
+			json_object_set_new(result, "video", session->media.has_video ? json_true() : json_false());
 		} else if(!strcasecmp(request_text, "bridge_out")) {
 			/* Point this leg's bridge socket at the mixer.  Separate from
 			 * bridge_in because the mixer only reports its own address after the

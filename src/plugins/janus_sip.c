@@ -1352,6 +1352,7 @@ typedef struct janus_sip_media {
 	guint16 bridge_out_seq;
 	guint32 bridge_in_packets;		/* Injected into the SIP leg, for diagnostics */
 	gboolean bridge_muted_logged;
+	gboolean bridge_out_logged;
 } janus_sip_media;
 
 typedef struct janus_sip_dtmf {
@@ -2813,6 +2814,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->media.bridge_out_seq = 0;
 	session->media.bridge_in_packets = 0;
 	session->media.bridge_muted_logged = FALSE;
+	session->media.bridge_out_logged = FALSE;
 	session->media.has_audio = FALSE;
 	session->media.audio_rtp_fd = -1;
 	session->media.audio_rtcp_fd= -1;
@@ -9052,6 +9054,7 @@ static int janus_sip_bridge_open(janus_sip_session *session) {
 	session->media.bridge_port = ntohs(addr.sin_port);
 	session->media.bridge_ts_inited = FALSE;
 	session->media.bridge_muted_logged = FALSE;
+	session->media.bridge_out_logged = FALSE;
 	g_atomic_int_set(&session->media.bridge_active, 1);
 	JANUS_LOG(LOG_INFO, "[SIP-%s] Conference bridge listening on port %d\n",
 		session->account.username, session->media.bridge_port);
@@ -9533,6 +9536,13 @@ static void *janus_sip_relay_thread(void *data) {
 					janus_mutex_unlock(&session->rtp_forwarders_mutex);
 					/* Conference bridge: hand what the peer says to the mixer (WT-783) */
 					if(session->media.bridge_connected && session->media.bridge_fd != -1) {
+						if(!session->media.bridge_out_logged) {
+							session->media.bridge_out_logged = TRUE;
+							janus_rtp_header *bh = (janus_rtp_header *)buffer;
+							JANUS_LOG(LOG_INFO, "[SIP-%s] conference bridge %d: first packet to the mixer pt=%d ssrc=%"SCNu32" seq=%"SCNu16" ts=%"SCNu32" len=%d\n",
+								session->account.username, session->media.bridge_port,
+								bh->type, ntohl(bh->ssrc), ntohs(bh->seq_number), ntohl(bh->timestamp), bytes);
+						}
 						if(send(session->media.bridge_fd, buffer, bytes, 0) < 0) {
 							JANUS_LOG(LOG_HUGE, "[SIP-%s] Error sending peer audio to the mixer... %s\n",
 								session->account.username, g_strerror(errno));

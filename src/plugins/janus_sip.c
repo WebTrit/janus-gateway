@@ -1341,6 +1341,7 @@ typedef struct janus_sip_media {
 	guint32 bridge_out_ts;
 	guint16 bridge_out_seq;
 	guint32 bridge_in_packets;		/* Injected into the SIP leg, for diagnostics */
+	gboolean bridge_muted_logged;
 } janus_sip_media;
 
 typedef struct janus_sip_dtmf {
@@ -2799,6 +2800,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->media.bridge_out_ts = 0;
 	session->media.bridge_out_seq = 0;
 	session->media.bridge_in_packets = 0;
+	session->media.bridge_muted_logged = FALSE;
 	session->media.has_audio = FALSE;
 	session->media.audio_rtp_fd = -1;
 	session->media.audio_rtcp_fd= -1;
@@ -9010,6 +9012,7 @@ static int janus_sip_bridge_open(janus_sip_session *session) {
 	session->media.bridge_fd = fd;
 	session->media.bridge_port = ntohs(addr.sin_port);
 	session->media.bridge_ts_inited = FALSE;
+	session->media.bridge_muted_logged = FALSE;
 	g_atomic_int_set(&session->media.bridge_active, 1);
 	JANUS_LOG(LOG_INFO, "[SIP-%s] Conference bridge listening on port %d\n",
 		session->account.username, session->media.bridge_port);
@@ -9025,8 +9028,8 @@ static void janus_sip_bridge_close(janus_sip_session *session) {
 		session->media.bridge_fd = -1;
 	}
 	if(session->media.bridge_in_packets > 0) {
-		JANUS_LOG(LOG_INFO, "[SIP-%s] conference bridge closed after %"SCNu32" injected packets\n",
-			session->account.username, session->media.bridge_in_packets);
+		JANUS_LOG(LOG_INFO, "[SIP-%s] conference bridge %d closed after %"SCNu32" injected packets\n",
+			session->account.username, session->media.bridge_port, session->media.bridge_in_packets);
 	}
 	session->media.bridge_port = 0;
 	session->media.bridge_ts_inited = FALSE;
@@ -9050,10 +9053,18 @@ static void janus_sip_bridge_poke(janus_sip_session *session) {
 static void janus_sip_bridge_relay_to_peer(janus_sip_session *session, char *buffer, int bytes) {
 	if(session == NULL || bytes < 12 || session->media.audio_rtp_fd == -1)
 		return;
-	if(!session->media.audio_send)
+	if(!session->media.audio_send || (session->media.on_hold &&
+			session->media.hold_audio_dir != JANUS_SDP_SENDONLY)) {
+		/* The leg cannot receive the mix right now.  Worth saying once: silence in
+		 * a conference is otherwise indistinguishable from a wiring mistake. */
+		if(!session->media.bridge_muted_logged) {
+			session->media.bridge_muted_logged = TRUE;
+			JANUS_LOG(LOG_WARN, "[SIP-%s] conference bridge %d: dropping the mix, leg not sending (audio_send=%d, on_hold=%d)\n",
+				session->account.username, session->media.bridge_port,
+				session->media.audio_send, session->media.on_hold);
+		}
 		return;
-	if(session->media.on_hold && session->media.hold_audio_dir != JANUS_SDP_SENDONLY)
-		return;
+	}
 	janus_rtp_header *header = (janus_rtp_header *)buffer;
 	guint32 in_ts = ntohl(header->timestamp);
 	if(!session->media.bridge_ts_inited) {
@@ -9069,8 +9080,8 @@ static void janus_sip_bridge_relay_to_peer(janus_sip_session *session, char *buf
 	session->media.bridge_out_seq++;
 	session->media.bridge_in_packets++;
 	if(session->media.bridge_in_packets == 1) {
-		JANUS_LOG(LOG_INFO, "[SIP-%s] conference bridge: first packet from the mixer injected into the SIP leg\n",
-			session->account.username);
+		JANUS_LOG(LOG_INFO, "[SIP-%s] conference bridge %d: first packet from the mixer injected into the SIP leg\n",
+			session->account.username, session->media.bridge_port);
 	}
 	header->ssrc = htonl(session->media.audio_ssrc);
 	header->timestamp = htonl(session->media.bridge_out_ts);
